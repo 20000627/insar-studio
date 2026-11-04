@@ -1,0 +1,35 @@
+import sys, json
+from pathlib import Path
+import numpy as np
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from insar_studio.core.io import load_stack
+from insar_studio.core.inversion import load_pair_cube, invert_arrays
+from insar_studio.core.utils import downsample_real, downsample_complex
+
+root=Path(__file__).resolve().parents[1]/"workspace/prototypes/p1"
+stack=load_stack(root); meta=stack.meta; truth=np.load(root/"data/stack/truth.npz")
+net=json.load(open(root/"data/network.json")); pairs=net["pairs"]
+phase,coh,mask,kept=load_pair_cube(root,pairs,corrected=False)
+m=2; k=4*np.pi/meta["wavelength_m"]
+# subtract synthetic atmosphere (perfect GACOS)
+atm=truth["atmosphere_mm"]
+ph2=phase.copy()
+for idx,p in enumerate(kept):
+    a=downsample_complex((k*(atm[p["sec"]]-atm[p["ref"]])/1000).astype(np.complex64)[:220,:260],m).real
+    ph2[idx]-=a
+# also test perfect dem removal
+demcorr=truth["dem_true"]-truth["dem_ref"]
+bp=np.asarray(truth["bperp"])
+ph3=ph2.copy()
+for idx,p in enumerate(kept):
+    d=downsample_complex((k*(bp[p["sec"]]-bp[p["ref"]])*demcorr/(meta["slant_range_m"]*np.sin(np.deg2rad(meta["incidence_deg"])))).astype(np.complex64)[:220,:260],m).real
+    ph3[idx]-=d
+for name,ph in [("orig",phase),("noatm",ph2),("noatm+dem",ph3)]:
+    for dem in [False,True]:
+        res=invert_arrays(root,ph,coh,mask,kept,meta,{"estimate_dem_error":dem,"aps_iterations":0,"regularization":0.05})
+        vel=res["velocity_mm_yr"]; valid=res["valid"]; disp=res["disp_mm"]
+        tv=downsample_real(truth["velocity_mm_yr"],m); td0=truth["disp_los_mm"]-truth["disp_los_mm"][0]
+        td=np.stack([downsample_real(td0[i],m) for i in range(td0.shape[0])])
+        v=tv[:vel.shape[0],:vel.shape[1]]; d=td[:,:disp.shape[1],:disp.shape[2]]
+        vr=np.sqrt(np.nanmean((vel-v)[valid]**2)); dr=np.sqrt(np.nanmean((disp-d)[:,valid]**2))
+        print(name,"dem",dem,"vRMSE",round(vr,2),"dRMSE",round(dr,2),"vmed",round(np.nanmedian(vel[valid]),2),"vminmax",round(np.nanmin(vel[valid]),1),round(np.nanmax(vel[valid]),1))

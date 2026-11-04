@@ -1,0 +1,980 @@
+"""Flask JSON API and static single-page client."""
+
+from __future__ import annotations
+
+import io
+import json
+import platform
+import re
+import shutil
+import sys
+import traceback
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+from flask import Flask, abort, jsonify, render_template, request, send_file
+
+from . import __version__
+from .config import (
+    DEFAULT_PROCESSING,
+    FORMATS,
+    STATIC_DIR,
+    TEMPLATE_DIR,
+    TECHNIQUES,
+    WORKSPACE_DIR,
+    ensure_runtime_dirs,
+)
+from .core.gacos import GacosClient
+from .core.io import load_stack, safe_join
+from .core.utils import atomic_write_json, format_bytes, read_json
+from . import download as download_mod
+from .health import diagnose_project
+from .importer import import_stack
+from .jobs import JobBusyError, JobManager
+from .params import ParamError, merge_params, public_params, validate_params
+from .pipeline import (
+    run_atmosphere_step,
+    run_coregistration,
+    run_interferometry,
+    run_inversion_step,
+    run_network,
+    run_pipeline,
+    stage_ready,
+)
+from .project import ProjectStore, route_defaults
+from .report import export_zip, generate_report, points_csv, series_csv
+from .validation import validate_demo
+
+
+def _json_error(message: str, status: int = 400, **extra: Any):
+    payload = {"error": message, **extra}
+    return jsonify(payload), status
+
+
+def _bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).lower() in ("1", "true", "yes", "on", "是")
+
+
+def _stack_n_dates(root: Path) -> int | None:
+    meta = read_json(root / "data" / "stack" / "meta.json", {}) or {}
+    try:
+        value = int(meta.get("n_dates") or 0)
+    except (TypeError, ValueError):
+        return None
+    return value or None
+
+
+def _busy_response(job: dict[str, Any]):
+    return _json_error(
+        f"该项目已有任务在运行：{job.get('label') or job.get('kind') or job.get('id')}",
+        409,
+        job=job,
+    )
+
+
+def _ensure_idle(jobs: JobManager, project_id: str):
+    active = jobs.active(project_id)
+    if active:
+        return _busy_response(active[0])
+    return None
+
+
+def _package_version(name: str) -> str | None:
+    try:
+        module = __import__(name)
+        return getattr(module, "__version__", "installed")
+    except Exception:
+        return None
+
+
+def _doctor() -> dict[str, Any]:
+    checks = []
+    checks.append({"name": "Python", "ok": sys.version_info >= (3, 9), "value": platform.python_version()})
+    for package in ("numpy", "scipy", "matplotlib", "skimage", "flask", "tifffile", "docx"):
+        version = _package_version(package)
+        checks.append({"name": package, "ok": version is not None, "value": version or "未安装"})
+    snaphu = shutil.which("snaphu")
+    checks.append({"name": "SNAPHU（可选）", "ok": bool(snaphu), "value": snaphu or "未安装 · 使用内置解缠"})
+    try:
+        WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
+        probe = WORKSPACE_DIR / ".write_test"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+        writable = True
+    except Exception as exc:
+        writable = False
+        checks.append({"name": "工作区写入", "ok": False, "value": str(exc)})
+    if writable:
+        checks.append({"name": "工作区写入", "ok": True, "value": str(WORKSPACE_DIR)})
+    free = shutil.disk_usage(WORKSPACE_DIR).free if WORKSPACE_DIR.exists() else 0
+    checks.append({"name": "可用磁盘", "ok": free > 500 * 1024 * 1024, "value": format_bytes(free)})
+    return {
+        "version": __version__,
+        "platform": platform.platform(),
+        "workspace": str(WORKSPACE_DIR),
+        "checks": checks,
+        "ok": all(c["ok"] for c in checks if c["name"] not in ("SNAPHU（可选）",)),
+    }
+
+
+def create_app() -> Flask:
+    ensure_runtime_dirs()
+    app = Flask(
+        __name__,
+        static_folder=str(STATIC_DIR),
+        template_folder=str(TEMPLATE_DIR),
+        static_url_path="/static",
+    )
+    app.json.ensure_ascii = False
+    app.config["MAX_CONTENT_LENGTH"] = 64 * 1024 * 1024
+    store = ProjectStore()
+    jobs = JobManager()
+    app.extensions["insar_store"] = store
+    app.extensions["insar_jobs"] = jobs
+
+    # ------------------------------------------------------------------ pages
+    @app.get("/")
+    def index():
+        return render_template("index.html", version=__version__)
+
+    # --------------------------------------------------------------- metadata
+    @app.get("/api/health")
+    def health():
+        return jsonify({"ok": True, "version": __version__, "workspace": str(WORKSPACE_DIR)})
+
+    @app.get("/api/capabilities")
+    def capabilities():
+        return jsonify(
+            {
+                "version": __version__,
+                "techniques": TECHNIQUES,
+                "formats": FORMATS,
+                "defaults": DEFAULT_PROCESSING,
+                "workspace": str(WORKSPACE_DIR),
+                "snaphu": bool(shutil.which("snaphu")),
+                "gacos": {"demo": True, "local": True, "online": True},
+                "download_providers": download_mod.provider_help(),
+                "truth": True,
+            }
+        )
+
+    @app.get("/api/doctor")
+    def doctor():
+        return jsonify(_doctor())
+
+    # --------------------------------------------------------------- projects
+    @app.get("/api/projects")
+    def list_projects():
+        rows = store.list()
+        for row in rows:
+            active = jobs.active(row["id"])
+            row["active_job"] = active[0] if active else None
+        return jsonify({"projects": rows})
+
+    @app.post("/api/projects")
+    def create_project():
+        body = request.get_json(silent=True)
+        body = body if isinstance(body, dict) else {}
+        name = str(body.get("name") or "新建项目").strip()[:120] or "新建项目"
+        technique = str(body.get("technique") or "sbas").lower()
+        if technique not in TECHNIQUES:
+            return _json_error("未知技术路线")
+        source = str(body.get("source") or "demo").lower()
+        if source not in ("demo", "import", "empty"):
+            return _json_error("未知项目来源")
+        if source == "import" and not str(body.get("path") or "").strip():
+            return _json_error("导入项目必须提供数据路径")
+        try:
+            params = validate_params(body.get("params") or {}, technique=technique)
+        except ParamError as exc:
+            return _json_error(str(exc))
+        project = None
+        try:
+            if source == "demo":
+                project = store.create_demo(name, technique, params)
+            elif source == "import":
+                project = store.create(name, technique, params=params, source="import")
+                meta = import_stack(
+                    store.path(project["id"]),
+                    str(body.get("path")),
+                    dem_path=body.get("dem_path"),
+                    meta_overrides=body.get("meta") or {},
+                )
+                project["stack"] = {
+                    "rows": meta["rows"],
+                    "cols": meta["cols"],
+                    "n_dates": meta["n_dates"],
+                    "dates": meta["dates"],
+                    "platform": meta["platform"],
+                    "source": meta["source"],
+                }
+                project["source"] = "import"
+                project["demo"] = False
+                store.save(project)
+            else:
+                project = store.create(name, technique, params=params, source="empty")
+            return jsonify({"project": project}), 201
+        except Exception as exc:
+            # Never leave a half-created project behind, for demos and imports.
+            try:
+                if project:
+                    store.delete(project["id"])
+            except Exception:
+                pass
+            return _json_error(str(exc), 400)
+
+    @app.get("/api/projects/<project_id>")
+    def get_project(project_id: str):
+        try:
+            overview = store.overview(project_id)
+            active = jobs.active(project_id)
+            overview["active_job"] = active[0] if active else None
+            return jsonify(overview)
+        except FileNotFoundError:
+            return _json_error("项目不存在", 404)
+
+    @app.patch("/api/projects/<project_id>")
+    def patch_project(project_id: str):
+        body = request.get_json(silent=True)
+        body = body if isinstance(body, dict) else {}
+        allowed = {k: v for k, v in body.items() if k in ("name", "notes", "technique", "params", "tags")}
+        if ("params" in allowed or "technique" in allowed) and jobs.active(project_id):
+            return _busy_response(jobs.active(project_id)[0])
+        try:
+            project = store.update(project_id, allowed)
+            return jsonify({"project": project})
+        except FileNotFoundError:
+            return _json_error("项目不存在", 404)
+        except (ParamError, ValueError) as exc:
+            return _json_error(str(exc), 400)
+
+    @app.delete("/api/projects/<project_id>")
+    def delete_project(project_id: str):
+        active = jobs.active(project_id)
+        if active:
+            return _busy_response(active[0])
+        try:
+            store.delete(project_id)
+            return jsonify({"ok": True})
+        except Exception as exc:
+            return _json_error(str(exc), 400)
+
+    @app.post("/api/projects/<project_id>/reset")
+    def reset_project(project_id: str):
+        active = jobs.active(project_id)
+        if active:
+            return _busy_response(active[0])
+        body = request.get_json(silent=True)
+        body = body if isinstance(body, dict) else {}
+        keep_coreg = _bool(body.get("keep_coreg"), True)
+        try:
+            project = store.reset_derived(project_id, keep_coreg=keep_coreg)
+            return jsonify({"ok": True, "project": project})
+        except FileNotFoundError:
+            return _json_error("项目不存在", 404)
+        except Exception as exc:
+            return _json_error(str(exc), 500)
+
+    @app.get("/api/projects/<project_id>/health")
+    def project_health(project_id: str):
+        try:
+            active = jobs.active(project_id)
+            if active:
+                return _busy_response(active[0])
+            return jsonify(diagnose_project(store.path(project_id)))
+        except FileNotFoundError:
+            return _json_error("项目不存在", 404)
+        except Exception as exc:
+            return _json_error(f"项目体检失败：{exc}", 500)
+
+    @app.get("/api/projects/<project_id>/preview/stack")
+    def stack_preview(project_id: str):
+        try:
+            return jsonify(store.stack_preview(project_id))
+        except FileNotFoundError:
+            return _json_error("项目不存在", 404)
+
+    @app.post("/api/projects/<project_id>/import")
+    def import_into_project(project_id: str):
+        active = jobs.active(project_id)
+        if active:
+            return _busy_response(active[0])
+        body = request.get_json(silent=True)
+        body = body if isinstance(body, dict) else {}
+        if not str(body.get("path") or "").strip():
+            return _json_error("缺少数据路径")
+        try:
+            root = store.path(project_id)
+            if not (root / "project.json").exists():
+                return _json_error("项目不存在", 404)
+            meta = import_stack(
+                root,
+                str(body.get("path")),
+                dem_path=body.get("dem_path"),
+                meta_overrides=body.get("meta") or {},
+            )
+            # New source data invalidates every derived product.
+            store.reset_derived(project_id, keep_coreg=False)
+            store.update(
+                project_id,
+                {
+                    "source": "import",
+                    "demo": False,
+                    "stack": {
+                        "rows": meta["rows"],
+                        "cols": meta["cols"],
+                        "n_dates": meta["n_dates"],
+                        "dates": meta["dates"],
+                    },
+                },
+            )
+            return jsonify({"ok": True, "stack": meta})
+        except Exception as exc:
+            return _json_error(str(exc), 400)
+
+    # --------------------------------------------------------------- pipeline
+    def _project_or_404(project_id: str) -> dict[str, Any]:
+        try:
+            return store.get(project_id)
+        except FileNotFoundError:
+            abort(404, description="项目不存在")
+
+    def _validation_when_idle(project_id: str, root: Path) -> dict[str, Any] | None:
+        # A running job purges and rewrites products.  Validating mid-run would
+        # read half-deleted arrays and can recreate products/validation.json
+        # while the job removes that directory.  The UI refreshes results once
+        # the job finishes, so returning no validation here is intentional.
+        if jobs.active(project_id):
+            return None
+        return validate_demo(root)
+
+    def _merge_params(
+        project: dict[str, Any],
+        incoming: dict[str, Any],
+        *,
+        n_dates: int | None = None,
+        technique: str | None = None,
+    ) -> dict[str, Any]:
+        # Processing parameters may legitimately include GACOS email/token or a
+        # download username.  They are kept in memory for the job only and are
+        # never written back to project.json by this endpoint.
+        merged = merge_params(project.get("params", {}), incoming)
+        if technique and technique != str(project.get("technique", "")).lower():
+            # A route switch must not inherit the previous route's sampling
+            # defaults.  Explicit values in the current request win.
+            for key, value in route_defaults(technique).items():
+                if key not in incoming:
+                    merged[key] = value
+        return validate_params(merged, technique=technique, n_dates=n_dates)
+
+    @app.post("/api/projects/<project_id>/run")
+    @app.post("/api/projects/<project_id>/run-all")
+    def run_all(project_id: str):
+        project = _project_or_404(project_id)
+        body = request.get_json(silent=True)
+        body = body if isinstance(body, dict) else {}
+        technique = str(body.get("technique") or project.get("technique", "sbas")).lower()
+        if technique not in TECHNIQUES:
+            return _json_error("未知技术路线")
+        try:
+            params = _merge_params(
+                project,
+                body.get("params") or {},
+                n_dates=_stack_n_dates(store.path(project_id)),
+                technique=technique,
+            )
+        except ParamError as exc:
+            return _json_error(str(exc))
+        steps = body.get("steps")
+        if steps is not None and not isinstance(steps, list):
+            return _json_error("steps 必须是阶段名称数组")
+        root = store.path(project_id)
+        route_changed = technique != str(project.get("technique", "")).lower()
+        effective_steps = None if route_changed else steps
+
+        def _run(ctx):
+            # Persist the route and reset old products inside the exclusive
+            # job, so a rejected or busy submission never destroys results.
+            if route_changed:
+                store.update(
+                    project_id,
+                    {"technique": technique, "params": public_params(params)},
+                )
+            return run_pipeline(
+                root,
+                technique=technique,
+                params=params,
+                steps=effective_steps,
+                progress=ctx.progress,
+            )
+
+        label = body.get("label") or "全流程处理"
+        if route_changed:
+            label = f"切换至 {technique.upper()} 并重算"
+        try:
+            job = jobs.submit(
+                project_id,
+                "pipeline",
+                _run,
+                label=label,
+                meta={"technique": technique, "steps": effective_steps, "route_changed": route_changed},
+            )
+        except JobBusyError as exc:
+            return _busy_response(exc.job)
+        return jsonify({"job": job}), 202
+
+    def _submit_step(project_id: str, kind: str, label: str, func) -> Any:
+        project = _project_or_404(project_id)
+        body = request.get_json(silent=True)
+        body = body if isinstance(body, dict) else {}
+        technique = str(body.get("technique") or project.get("technique", "sbas")).lower()
+        if technique not in TECHNIQUES:
+            return _json_error("未知技术路线")
+        root = store.path(project_id)
+        try:
+            params = _merge_params(
+                project,
+                body.get("params") or {},
+                n_dates=_stack_n_dates(root),
+                technique=technique,
+            )
+        except ParamError as exc:
+            return _json_error(str(exc))
+
+        route_changed = technique != str(project.get("technique", "")).lower()
+        prereq: list[str] = []
+        if not route_changed:
+            if kind == "interferometry" and not stage_ready(root, "network"):
+                prereq = ["network", "interferometry"]
+            elif kind == "atmosphere" and not stage_ready(root, "interferometry"):
+                prereq = ["interferometry", "atmosphere"]
+            elif kind == "inversion" and not stage_ready(root, "interferometry"):
+                prereq = ["interferometry", "inversion"]
+
+        if route_changed:
+            def _runner(ctx):
+                store.update(
+                    project_id,
+                    {"technique": technique, "params": public_params(params)},
+                )
+                # Route defaults (e.g. PS single-look, DS patch size) change
+                # the interferograms themselves, so nothing downstream can be
+                # reused safely.  Coregistration is route independent and is
+                # kept when possible.
+                return run_pipeline(
+                    root,
+                    technique=technique,
+                    params=params,
+                    steps=["network", "interferometry", "atmosphere", "inversion"],
+                    progress=ctx.progress,
+                )
+            effective_label = f"切换至 {technique.upper()} 并重算全流程"
+        elif prereq:
+            def _runner(ctx):
+                return run_pipeline(root, technique=technique, params=params, steps=prereq, progress=ctx.progress)
+            effective_label = f"{label}（自动补齐前置）"
+        else:
+            def _runner(ctx):
+                return func(root, technique, project, params, ctx)
+            effective_label = label
+
+        try:
+            job = jobs.submit(
+                project_id,
+                kind,
+                _runner,
+                label=effective_label,
+                meta={"technique": technique, "steps": prereq or None, "route_changed": route_changed},
+            )
+        except JobBusyError as exc:
+            return _busy_response(exc.job)
+        return jsonify({"job": job}), 202
+
+    @app.post("/api/projects/<project_id>/coregister")
+    def api_coregister(project_id: str):
+        return _submit_step(
+            project_id,
+            "coregistration",
+            "SLC 配准",
+            lambda root, technique, project, params, ctx: run_coregistration(root, params, ctx.progress),
+        )
+
+    @app.post("/api/projects/<project_id>/network")
+    def api_network(project_id: str):
+        return _submit_step(
+            project_id,
+            "network",
+            "构建干涉网络",
+            lambda root, technique, project, params, ctx: run_network(root, technique, params, ctx.progress),
+        )
+
+    @app.post("/api/projects/<project_id>/interferometry")
+    def api_interferometry(project_id: str):
+        return _submit_step(
+            project_id,
+            "interferometry",
+            "干涉图处理",
+            lambda root, technique, project, params, ctx: run_interferometry(root, technique, params, ctx.progress),
+        )
+
+    @app.post("/api/projects/<project_id>/atmosphere")
+    def api_atmosphere(project_id: str):
+        return _submit_step(
+            project_id,
+            "atmosphere",
+            "大气校正",
+            lambda root, technique, project, params, ctx: run_atmosphere_step(root, project, params, ctx.progress),
+        )
+
+    @app.post("/api/projects/<project_id>/inversion")
+    def api_inversion(project_id: str):
+        def _run(root, technique, project, params, ctx):
+            return run_inversion_step(root, project, technique, params, ctx.progress)
+
+        return _submit_step(project_id, "inversion", "时序反演", _run)
+
+    @app.post("/api/projects/<project_id>/validate")
+    def api_validate(project_id: str):
+        _project_or_404(project_id)
+        active = jobs.active(project_id)
+        if active:
+            return _busy_response(active[0])
+        result = validate_demo(store.path(project_id), force=True)
+        if result is None:
+            return _json_error("当前项目没有可用的合成真值或反演结果", 400)
+        return jsonify(result)
+
+    # ------------------------------------------------------------------- jobs
+    @app.get("/api/jobs")
+    def list_jobs():
+        try:
+            limit = int(request.args.get("limit", 30))
+        except (TypeError, ValueError):
+            limit = 30
+        return jsonify({"jobs": jobs.list(request.args.get("project"), limit=limit)})
+
+    @app.get("/api/jobs/<job_id>")
+    def get_job(job_id: str):
+        try:
+            return jsonify(jobs.get(job_id))
+        except FileNotFoundError:
+            return _json_error("任务不存在", 404)
+
+    @app.post("/api/jobs/<job_id>/cancel")
+    def cancel_job(job_id: str):
+        return jsonify({"cancelled": jobs.cancel(job_id)})
+
+    # --------------------------------------------------------------- products
+    @app.get("/api/projects/<project_id>/network")
+    def api_network_data(project_id: str):
+        _project_or_404(project_id)
+        root = store.path(project_id)
+        data = read_json(root / "data" / "network.json", {}) or {}
+        return jsonify(data)
+
+    @app.get("/api/projects/<project_id>/interferograms")
+    def api_ifg_data(project_id: str):
+        _project_or_404(project_id)
+        root = store.path(project_id)
+        summary = read_json(root / "interferograms" / "summary.json", {}) or {}
+        network = read_json(root / "data" / "network.json", {}) or {}
+        metas = []
+        for pair in network.get("pairs", []):
+            meta = read_json(root / "interferograms" / pair["id"] / "meta.json", {}) or {}
+            if meta:
+                metas.append(meta)
+        return jsonify({"summary": summary, "pairs": metas, "network": network})
+
+    @app.get("/api/projects/<project_id>/atmosphere")
+    def api_atmosphere_data(project_id: str):
+        _project_or_404(project_id)
+        return jsonify(read_json(store.path(project_id) / "data" / "atmosphere" / "atmosphere.json", {}) or {})
+
+    @app.get("/api/projects/<project_id>/inversion")
+    def api_inversion_data(project_id: str):
+        _project_or_404(project_id)
+        root = store.path(project_id)
+        data = read_json(root / "products" / "inversion.json", {}) or {}
+        data["validation"] = _validation_when_idle(project_id, root)
+        return jsonify(data)
+
+    @app.get("/api/projects/<project_id>/results")
+    def api_results(project_id: str):
+        _project_or_404(project_id)
+        root = store.path(project_id)
+        overview = store.overview(project_id)
+        overview["validation"] = _validation_when_idle(project_id, root)
+        overview["report"] = {
+            "markdown": (root / "products" / "report" / "report.md").exists(),
+            "docx": (root / "products" / "report" / "report.docx").exists(),
+        }
+        return jsonify(overview)
+
+    @app.get("/api/projects/<project_id>/peaks")
+    def api_peaks(project_id: str):
+        """Return reference and extreme-deformation pixels for the inspector."""
+        _project_or_404(project_id)
+        root = store.path(project_id)
+        arrays = root / "products" / "arrays"
+        inv = read_json(root / "products" / "inversion.json", {}) or {}
+        technique = str(inv.get("technique", "sbas")).lower()
+        try:
+            if technique == "dinsar":
+                arr = np.load(arrays / "disp_pair_mm.npy", allow_pickle=False)
+                label = "displacement"
+            else:
+                arr = np.load(arrays / "velocity_mm_yr.npy", allow_pickle=False)
+                label = "velocity"
+            valid = np.load(arrays / "valid.npy", allow_pickle=False).astype(bool)
+        except FileNotFoundError:
+            return _json_error("尚未生成反演产品", 404)
+        data = np.where(valid & np.isfinite(arr), arr, np.nan)
+        if not np.isfinite(data).any():
+            return _json_error("没有有效像元", 400)
+        flat = np.flatnonzero(np.isfinite(data).ravel())
+        absmax = flat[int(np.argmax(np.abs(data.ravel()[flat])))]
+        ref = inv.get("reference_pixel") or [data.shape[0] // 2, data.shape[1] // 2]
+        rr, cc = int(ref[0]), int(ref[1])
+        if not (0 <= rr < data.shape[0] and 0 <= cc < data.shape[1]):
+            rr, cc = data.shape[0] // 2, data.shape[1] // 2
+        row, col = np.unravel_index(absmax, data.shape)
+        return jsonify(
+            {
+                "technique": technique,
+                "field": label,
+                "shape": [int(data.shape[0]), int(data.shape[1])],
+                "reference_pixel": [rr, cc],
+                "peak": {"row": int(row), "col": int(col), "value": float(data[row, col])},
+                "max": {
+                    "value": float(np.nanmax(data)),
+                    "row": int(np.unravel_index(int(np.nanargmax(data)), data.shape)[0]),
+                    "col": int(np.unravel_index(int(np.nanargmax(data)), data.shape)[1]),
+                },
+                "min": {
+                    "value": float(np.nanmin(data)),
+                    "row": int(np.unravel_index(int(np.nanargmin(data)), data.shape)[0]),
+                    "col": int(np.unravel_index(int(np.nanargmin(data)), data.shape)[1]),
+                },
+            }
+        )
+
+    @app.get("/api/projects/<project_id>/series")
+    def api_series(project_id: str):
+        _project_or_404(project_id)
+        root = store.path(project_id)
+        try:
+            row = int(request.args.get("row", "0"))
+            col = int(request.args.get("col", "0"))
+        except ValueError:
+            return _json_error("行列必须是整数")
+        arrays = root / "products" / "arrays"
+        meta = read_json(root / "data" / "stack" / "meta.json", {}) or {}
+        inv = read_json(root / "products" / "inversion.json", {}) or {}
+        try:
+            technique = str(inv.get("technique", "sbas")).lower()
+            if technique == "dinsar":
+                disp = np.load(arrays / "disp_pair_mm.npy", allow_pickle=False)
+                if not (0 <= row < disp.shape[0] and 0 <= col < disp.shape[1]):
+                    return _json_error("像元超出范围")
+                pair = inv.get("pair", {})
+                return jsonify(
+                    {
+                        "row": row,
+                        "col": col,
+                        "technique": "dinsar",
+                        "dates": [pair.get("ref_date"), pair.get("sec_date")],
+                        "disp_mm": [0.0, float(disp[row, col])],
+                        "valid": bool(np.load(arrays / "valid.npy", allow_pickle=False)[row, col]),
+                        "velocity_mm_yr": None,
+                        "temporal_coherence": float(np.load(arrays / "temporal_coherence.npy", allow_pickle=False)[row, col]),
+                    }
+                )
+            disp = np.load(arrays / "disp_ts_mm.npy", allow_pickle=False)
+            valid = np.load(arrays / "valid.npy", allow_pickle=False)
+            if not (0 <= row < disp.shape[1] and 0 <= col < disp.shape[2]):
+                return _json_error("像元超出范围")
+            tcoh = np.load(arrays / "temporal_coherence.npy", allow_pickle=False)[row, col]
+            vel = np.load(arrays / "velocity_mm_yr.npy", allow_pickle=False)[row, col]
+            return jsonify(
+                {
+                    "row": row,
+                    "col": col,
+                    "technique": technique,
+                    "dates": meta.get("dates", []),
+                    "disp_mm": disp[:, row, col].tolist(),
+                    "valid": bool(valid[row, col]),
+                    "velocity_mm_yr": None if not np.isfinite(vel) else float(vel),
+                    "temporal_coherence": None if not np.isfinite(tcoh) else float(tcoh),
+                }
+            )
+        except FileNotFoundError:
+            return _json_error("尚未生成反演产品", 404)
+
+    @app.get("/api/projects/<project_id>/series.csv")
+    def api_series_csv(project_id: str):
+        _project_or_404(project_id)
+        try:
+            row = int(request.args.get("row", "0"))
+            col = int(request.args.get("col", "0"))
+            path = series_csv(store.path(project_id), row, col)
+            return send_file(
+                path,
+                as_attachment=True,
+                download_name=f"series_r{row}_c{col}.csv",
+                mimetype="text/csv",
+            )
+        except FileNotFoundError:
+            return _json_error("尚未生成反演产品", 404)
+        except (ValueError, OSError) as exc:
+            return _json_error(str(exc), 400)
+
+    @app.get("/api/projects/<project_id>/points.csv")
+    def api_points_csv(project_id: str):
+        _project_or_404(project_id)
+        try:
+            path = points_csv(store.path(project_id))
+            return send_file(
+                path,
+                as_attachment=True,
+                download_name=f"{store.get(project_id).get('name', 'project')}_points.csv",
+                mimetype="text/csv",
+            )
+        except FileNotFoundError:
+            return _json_error("尚未生成反演产品", 404)
+        except (ValueError, OSError) as exc:
+            return _json_error(str(exc), 400)
+
+    # ------------------------------------------------------------ pair images
+    @app.get("/api/projects/<project_id>/pairs/<pair_id>/meta")
+    def pair_meta(project_id: str, pair_id: str):
+        _project_or_404(project_id)
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", pair_id):
+            return _json_error("干涉对编号非法", 400)
+        root = store.path(project_id)
+        meta = read_json(root / "interferograms" / pair_id / "meta.json", {}) or {}
+        if not meta:
+            return _json_error("干涉对不存在", 404)
+        return jsonify(meta)
+
+    @app.get("/api/projects/<project_id>/pairs/<pair_id>/image")
+    def pair_image(project_id: str, pair_id: str):
+        _project_or_404(project_id)
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", pair_id):
+            return _json_error("干涉对编号非法", 400)
+        root = store.path(project_id)
+        field = str(request.args.get("field", "unwrapped")).lower()
+        try:
+            path = _render_pair_image(root, pair_id, field)
+            return send_file(path, mimetype="image/png", max_age=60)
+        except FileNotFoundError:
+            return _json_error("干涉对产品不存在", 404)
+        except Exception as exc:
+            return _json_error(str(exc), 500)
+
+    # ---------------------------------------------------------------- assets
+    @app.get("/api/projects/<project_id>/asset/<path:rel>")
+    def asset(project_id: str, rel: str):
+        _project_or_404(project_id)
+        root = store.path(project_id)
+        try:
+            path = safe_join(root, rel)
+        except Exception:
+            return _json_error("路径越界", 400)
+        if not path.exists() or not path.is_file():
+            return _json_error("资源不存在", 404)
+        return send_file(path, max_age=60)
+
+    @app.get("/api/projects/<project_id>/download/<path:rel>")
+    def download_file(project_id: str, rel: str):
+        _project_or_404(project_id)
+        root = store.path(project_id)
+        try:
+            path = safe_join(root, rel)
+        except Exception:
+            return _json_error("路径越界", 400)
+        if not path.exists():
+            return _json_error("文件不存在", 404)
+        return send_file(path, as_attachment=True, download_name=path.name)
+
+    @app.post("/api/projects/<project_id>/report")
+    def api_report(project_id: str):
+        _project_or_404(project_id)
+        active = jobs.active(project_id)
+        if active:
+            return _busy_response(active[0])
+        try:
+            out = generate_report(store.path(project_id))
+            return jsonify(out)
+        except Exception as exc:
+            return _json_error(str(exc), 500)
+
+    @app.get("/api/projects/<project_id>/export")
+    def api_export(project_id: str):
+        _project_or_404(project_id)
+        active = jobs.active(project_id)
+        if active:
+            return _busy_response(active[0])
+        try:
+            path = export_zip(store.path(project_id))
+            return send_file(path, as_attachment=True, download_name=path.name, mimetype="application/zip")
+        except Exception as exc:
+            return _json_error(str(exc), 500)
+
+    # -------------------------------------------------------------- downloads
+    @app.get("/api/download/help")
+    def download_help():
+        return jsonify(download_mod.provider_help())
+
+    @app.post("/api/download/search")
+    def download_search():
+        body = request.get_json(silent=True)
+        body = body if isinstance(body, dict) else {}
+        try:
+            results = download_mod.search(
+                str(body.get("provider", "copernicus")),
+                bbox=body.get("bbox") or [0, 0, 1, 1],
+                start=str(body.get("start", "2023-01-01")),
+                end=str(body.get("end", "2023-12-31")),
+                max_results=int(body.get("max_results", 12)),
+                username=str(body.get("username", "")),
+                password=str(body.get("password", "")),
+            )
+            for item in results:
+                item["size_human"] = format_bytes(item.get("size") or 0)
+            return jsonify({"results": results, "provider": body.get("provider", "copernicus")})
+        except Exception as exc:
+            return _json_error(f"搜索失败: {exc}", 502)
+
+    @app.post("/api/download/fetch")
+    def download_fetch():
+        body = request.get_json(silent=True)
+        body = body if isinstance(body, dict) else {}
+        project = _project_or_404(str(body.get("project_id", "")))
+        root = store.path(project["id"])
+        url = str(body.get("url", ""))
+        provider = str(body.get("provider", "copernicus"))
+        name = download_mod.safe_filename(str(body.get("name") or "sentinel1_slc.zip"))
+        if not url:
+            return _json_error("缺少下载地址")
+
+        def _job(ctx):
+            def progress(frac, done):
+                ctx.progress(frac, f"下载 {format_bytes(done)}")
+
+            dest = download_mod.download(
+                url,
+                root / "data" / "downloads" / name,
+                provider=provider,
+                username=str(body.get("username", "")),
+                password=str(body.get("password", "")),
+                progress=progress,
+                cancel=lambda: ctx.cancelled,
+            )
+            return {"file": str(dest.relative_to(root)).replace("\\", "/"), "size": dest.stat().st_size}
+
+        try:
+            job = jobs.submit(project["id"], "download", _job, label=f"下载 {name}", meta={"provider": provider})
+        except JobBusyError as exc:
+            return _busy_response(exc.job)
+        return jsonify({"job": job}), 202
+
+    # ----------------------------------------------------------------- errors
+    @app.errorhandler(404)
+    def not_found(exc):
+        if request.path.startswith("/api/"):
+            return _json_error(getattr(exc, "description", "资源不存在"), 404)
+        return render_template("index.html", version=__version__), 404
+
+    @app.errorhandler(Exception)
+    def unhandled(exc):
+        if request.path.startswith("/api/"):
+            app.logger.exception("API error")
+            return _json_error(str(exc), 500, traceback=traceback.format_exc(limit=6) if app.debug else "")
+        raise exc
+
+    return app
+
+
+# --------------------------------------------------------------- pair render
+def _render_pair_image(root: Path, pair_id: str, field: str) -> Path:
+    pair_dir = root / "interferograms" / pair_id
+    meta = read_json(pair_dir / "meta.json", {}) or {}
+    if not meta:
+        raise FileNotFoundError("干涉对不存在")
+    src = {
+        "wrapped": "wrapped.npy",
+        "coherence": "coherence.npy",
+        "unwrapped": "unwrapped.npy",
+        "displacement": "displacement_mm.npy",
+        "atmcorr": "unwrapped_atmcorr.npy",
+        "atmosphere": "atmosphere_pair_mm.npy",
+    }.get(field, "unwrapped.npy")
+    path = pair_dir / src
+    if not path.exists():
+        raise FileNotFoundError(f"缺少 {src}")
+    mask_path = pair_dir / "mask.npy"
+    mask = np.load(mask_path, allow_pickle=False).astype(bool) if mask_path.exists() else None
+    arr = np.load(path, allow_pickle=False).astype(np.float32)
+    stamp = int(path.stat().st_mtime)
+    cache = WORKSPACE_DIR / "cache" / "figures"
+    cache.mkdir(parents=True, exist_ok=True)
+    out = cache / f"{root.name}_{pair_id}_{field}_{stamp}.png"
+    if out.exists():
+        return out
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import TwoSlopeNorm
+
+    from .core.plotting import GRID, INK, MUTED, PAPER, div_cmap, seq_cmap, _clean_axes
+
+    data = np.where(mask, arr, np.nan) if mask is not None else arr
+    fig, ax = plt.subplots(figsize=(5.2, 4.0))
+    if field == "wrapped":
+        im = ax.imshow(data, cmap="twilight", vmin=-np.pi, vmax=np.pi, interpolation="nearest")
+        cbar = fig.colorbar(im, ax=ax, fraction=0.04, pad=0.02)
+        cbar.set_label("rad", color=MUTED, fontsize=7)
+    elif field == "coherence":
+        im = ax.imshow(data, cmap=seq_cmap(), vmin=0, vmax=1, interpolation="nearest")
+        cbar = fig.colorbar(im, ax=ax, fraction=0.04, pad=0.02)
+        cbar.set_label("coherence", color=MUTED, fontsize=7)
+    else:
+        vals = data[np.isfinite(data)]
+        if vals.size:
+            lo, hi = np.percentile(vals, [2, 98])
+        else:
+            lo, hi = 0.0, 1.0
+        if field in ("unwrapped", "displacement", "atmcorr", "atmosphere"):
+            lim = max(abs(lo), abs(hi), 1e-6)
+            im = ax.imshow(data, cmap=div_cmap(), norm=TwoSlopeNorm(vmin=-lim, vcenter=0, vmax=lim), interpolation="nearest")
+            cbar = fig.colorbar(im, ax=ax, fraction=0.04, pad=0.02)
+            cbar.set_label("rad" if field in ("unwrapped", "atmcorr", "atmosphere") else "mm", color=MUTED, fontsize=7)
+        else:
+            im = ax.imshow(data, cmap=seq_cmap(), vmin=lo, vmax=hi, interpolation="nearest")
+            cbar = fig.colorbar(im, ax=ax, fraction=0.04, pad=0.02)
+    cbar.outline.set_edgecolor(GRID)
+    cbar.ax.tick_params(labelsize=7, colors=MUTED, length=0)
+    _clean_axes(ax)
+    title = {
+        "wrapped": "Wrapped phase",
+        "coherence": "Coherence",
+        "unwrapped": "Unwrapped phase",
+        "displacement": "LOS displacement",
+        "atmcorr": "Atmosphere-corrected phase",
+        "atmosphere": "Atmospheric delay",
+    }.get(field, field)
+    ax.set_title(f"{title} · {pair_id}", loc="left", pad=8)
+    fig.patch.set_facecolor(PAPER)
+    fig.tight_layout()
+    fig.savefig(out)
+    plt.close(fig)
+    return out
+
+
+app = create_app()
