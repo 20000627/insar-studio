@@ -15,7 +15,7 @@
 
 ![成果页图件](docs/images/ui-results.png)
 
-**文档**：[用户手册](docs/用户手册.md) · [使用指南](docs/使用指南.md) · [技术说明](docs/技术说明.md)
+**文档**：[用户手册](docs/用户手册.md) · [使用教程](docs/使用指南.md) · [技术说明](docs/技术说明.md)
 
 ## 目录
 
@@ -151,9 +151,11 @@ python -m insar_studio serve --open
 InSAR Studio 负责**时序处理与反演**，不负责 Sentinel-1 的 burst 拼接、精密轨道、TOPS 配准和地理编码。真实数据建议先在 SNAP / ISCE / Gamma 中完成：
 
 1. 轨道校正、burst 拼接、去斜、TOPS 配准；
-2. 生成配准后的复数 SLC 栈（或干涉图栈）；
+2. 生成配准后的复数 SLC 栈；
 3. 提供 DEM 与有效掩膜；
 4. 导出为 GeoTIFF / ENVI / NumPy 栈，再导入本工具。
+
+本工具不直接导入干涉图栈、解缠相位或现成的形变产品，也不支持 GRD、RAW、光学影像、点云和 GNSS。干涉图和时序产品必须由 SLC 栈在本工具或其他 InSAR 软件中生成。完整的影像类型、处理原理和适用边界见[使用教程第 5 章](docs/使用指南.md#5-支持的影像类型与处理原理)。
 
 ### 支持格式
 
@@ -162,6 +164,9 @@ InSAR Studio 负责**时序处理与反演**，不负责 Sentinel-1 的 burst �
 | SLC 栈 | 目录 + `stack.json`/`meta.json` + `slc.npy`；单个 `.npy`；单个 `.npz` 打包；ENVI `.hdr/.dat`；复数 GeoTIFF 目录；Sentinel-1 SAFE（实验性） |
 | DEM | `.tif/.tiff`、`.npy`、ENVI |
 | GACOS | `.ztd + .rsc`、`.tif`、`.npy` |
+| 不支持 | 干涉图、解缠相位、形变产品、GRD、RAW、光学影像、点云、GNSS |
+
+实数振幅/强度图可以导入，但会被转成零相位复数，只能做界面和流程演示，不能产生有意义的形变结果。
 
 NumPy 栈形状为 `(n_dates, rows, cols)`，复数类型 `complex64`。最小示例：
 
