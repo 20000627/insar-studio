@@ -177,6 +177,11 @@ a:hover { text-decoration: underline; }
 .rail-search input { border: 0; outline: 0; background: transparent; width: 100%; font-size: 12px; }
 .project-list { flex: 1; overflow: auto; padding: 0 10px 12px; }
 .rail-empty { padding: 24px 12px; color: var(--muted); font-size: 12px; text-align: center; line-height: 1.7; }
+.rail-more {
+  width: 100%; margin-top: 4px; padding: 8px 10px; border: 1px dashed var(--line);
+  border-radius: 8px; background: transparent; color: var(--muted); font-size: 11px; cursor: pointer;
+}
+.rail-more:hover { border-color: var(--teal); color: var(--green); }
 .project-item {
   width: 100%;
   text-align: left;
@@ -808,6 +813,18 @@ table.data .strong { font-weight: 700; }
 }
 .modal-close:hover { background: #eee8da; color: var(--ink); }
 .modal-body { padding: 18px 20px; }
+.export-list { display: flex; flex-direction: column; gap: 10px; }
+.export-option {
+  display: flex; align-items: center; justify-content: space-between; gap: 16px;
+  padding: 14px 16px; border: 1px solid var(--line); border-radius: 10px;
+}
+.export-option.recommended { border-color: var(--teal); background: rgba(56, 110, 92, .04); }
+.export-copy h3 { margin: 0 0 4px; font-size: 13px; color: var(--ink); }
+.export-copy p { margin: 0 0 6px; font-size: 11px; line-height: 1.55; color: var(--muted); }
+.export-option .tag {
+  display: inline-block; margin-left: 7px; padding: 1px 7px; border-radius: 99px;
+  background: var(--teal); color: #fff; font-size: 9px; font-weight: 600; vertical-align: 1px;
+}
 .modal-foot { display: flex; justify-content: flex-end; gap: 8px; padding: 13px 20px; border-top: 1px solid var(--line); background: #faf6eb; }
 .modal .tech-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .modal .field { margin-bottom: 11px; }

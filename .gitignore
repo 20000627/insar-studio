@@ -65,5 +65,12 @@ desktop.ini
 *.tif
 *.tiff
 
+# 示例：保留紧凑回放数据和结果，原始影像/解压目录/临时工作区仍忽略
+!examples/*/data/*.npy
+!examples/*/results/*.npy
+!examples/*/results/*.tif
+examples/*/source/
+examples/*/workspace/
+
 # 本地发布目录
 release/

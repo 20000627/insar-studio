@@ -11,9 +11,69 @@ from typing import Any
 
 import numpy as np
 
-from .core.utils import read_json
+from .core.utils import format_bytes, read_json
 from .params import public_params
 from .validation import validate_demo
+
+#: File types kept in an export.  Everything under ``products`` matches these,
+#: while caches and editor backups are skipped.
+_EXPORT_SUFFIXES = (".npy", ".tif", ".tiff", ".png", ".csv", ".json", ".md", ".docx")
+
+#: ``results`` is the small, shareable package; ``full`` keeps the source stack
+#: and all intermediates for archival or reprocessing on another machine.
+EXPORT_MODES = ("results", "full")
+_EXPORT_ROOTS = {
+    "results": ("products",),
+    "full": (
+        "products",
+        "data/stack",
+        "data/network.json",
+        "data/processed/coreg.json",
+        "data/atmosphere",
+        "interferograms",
+    ),
+}
+
+
+def _iter_export_files(root: Path, mode: str):
+    """Yield files that belong in an export, skipping the export directory."""
+    for folder in _EXPORT_ROOTS[mode]:
+        path = root / folder
+        if not path.exists():
+            continue
+        candidates = [path] if path.is_file() else (item for item in path.rglob("*") if item.is_file())
+        for item in candidates:
+            rel = item.relative_to(root)
+            if "exports" in rel.parts:
+                continue
+            if item.suffix.lower() not in _EXPORT_SUFFIXES:
+                continue
+            yield item
+
+
+def export_summary(root: Path) -> dict[str, Any]:
+    """Return the file count and uncompressed size of each export mode."""
+    root = Path(root)
+    modes: dict[str, Any] = {}
+    for mode in EXPORT_MODES:
+        files = list(_iter_export_files(root, mode))
+        total = 0
+        for item in files:
+            try:
+                total += item.stat().st_size
+            except OSError:
+                continue
+        modes[mode] = {
+            "files": len(files),
+            "bytes": total,
+            "human": format_bytes(total),
+            "label": "仅成果" if mode == "results" else "完整包（含原始栈）",
+        }
+    return {
+        "modes": modes,
+        "recommended": "results",
+        "note": "ZIP 实际大小通常小于未压缩合计；导出在请求内同步生成。",
+    }
 
 
 def _atomic_text(path: Path, text: str) -> Path:
@@ -96,6 +156,23 @@ def build_markdown(root: Path) -> str:
     lines.append(f"| 干涉 | {ifg.get('n_pairs', '—')} 对 · 平均相干性 {_fmt(ifg.get('mean_coherence'), 2)} |")
     lines.append(f"| 大气 | {atm.get('method', '—')} · 相位离散度降低 {_fmt(atm.get('phase_std_reduction_pct'), 1, '%')} |")
     lines.append(f"| 反演 | {str(inv.get('technique', '—')).upper()} · 有效像元 {inv.get('valid_pixels', '—')} |")
+    geo = inv.get("geocoding") if isinstance(inv.get("geocoding"), dict) else {}
+    geo_status = str(geo.get("status", "")).lower()
+    if geo_status in {"done", "partial"}:
+        geo_detail = "已输出地图坐标 GeoTIFF"
+        if geo_status == "partial":
+            geo_detail = "部分覆盖 · 已输出地图坐标 GeoTIFF"
+        if geo.get("coverage") is not None:
+            try:
+                geo_detail += f" · 覆盖 {float(geo['coverage']):.1%}"
+            except (TypeError, ValueError):
+                pass
+        if geo.get("files"):
+            geo_detail += f" · {len(geo['files'])} 个文件"
+    else:
+        reasons = geo.get("reasons") or ["尚未运行地理编码"]
+        geo_detail = f"不可用 · {reasons[0]}"
+    lines.append(f"| 地理编码 | {geo_detail} |")
     lines.append("")
     params = {**public_params(project.get("params", {})), **public_params(inv.get("params", {}))}
     lines.append("关键参数：")
@@ -160,6 +237,7 @@ def build_markdown(root: Path) -> str:
     lines.append("- 本报告由 InSAR Studio 自动生成；结果质量取决于数据质量、网络设计、解缠与大气校正。")
     lines.append("- 演示项目使用合成数据，真值校验只用于验证软件链路，不能外推为真实场景精度。")
     lines.append("- 在线 GACOS、Copernicus/ASF 下载适配器需要在联网环境配置账号；本地产品路线更适合业务化运行。")
+    lines.append("- 地理编码依赖参考轨道和完整几何元数据；缺少时成果只保留雷达坐标，不会伪造经纬度。")
     lines.append("- 速率与位移均为视线向（LOS），未做升降轨分解或 GNSS 基准校正。")
     lines.append("")
     lines.append("---")
@@ -392,36 +470,26 @@ def generate_report(root: Path) -> dict[str, Any]:
     }
 
 
-def export_zip(root: Path) -> Path:
+def export_zip(root: Path, *, mode: str = "full") -> Path:
     root = Path(root)
+    if mode not in EXPORT_MODES:
+        raise ValueError(f"未知导出模式: {mode}")
     out_dir = root / "products" / "exports"
     out_dir.mkdir(parents=True, exist_ok=True)
-    target = out_dir / f"{root.name}_insar.zip"
+    stem = f"{root.name}_insar" + ("_results" if mode == "results" else "")
+    target = out_dir / f"{stem}.zip"
     tmp = target.with_name(target.name + ".tmp")
     if tmp.exists():
         tmp.unlink()
     with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
         zf.write(root / "project.json", "project.json")
-        for folder in ("products", "data/stack", "data/network.json", "data/processed/coreg.json", "data/atmosphere", "interferograms"):
-            p = root / folder
-            if not p.exists():
-                continue
-            if p.is_file():
-                zf.write(p, str(p.relative_to(root)))
-                continue
-            for f in p.rglob("*"):
-                if not f.is_file():
-                    continue
-                rel = f.relative_to(root)
-                if "exports" in rel.parts:
-                    continue
-                if f.suffix.lower() in (".npy", ".tif", ".tiff", ".png", ".csv", ".json", ".md", ".docx"):
-                    zf.write(f, str(rel))
+        for item in _iter_export_files(root, mode):
+            zf.write(item, str(item.relative_to(root)))
     try:
         os.replace(tmp, target)
     except OSError:
         # If a viewer holds the previous ZIP open on Windows, keep a unique
         # copy instead of failing the download.
-        target = out_dir / f"{root.name}_insar_{time.strftime('%Y%m%d_%H%M%S')}.zip"
+        target = out_dir / f"{stem}_{time.strftime('%Y%m%d_%H%M%S')}.zip"
         os.replace(tmp, target)
     return target

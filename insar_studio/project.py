@@ -7,8 +7,11 @@ own directory and can be rebuilt without touching the project record.
 
 from __future__ import annotations
 
+import copy
 import os
 import shutil
+import stat as stat_module
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -17,13 +20,15 @@ from typing import Any
 import numpy as np
 
 from .config import DEFAULT_PROCESSING, PROJECTS_DIR, new_project_id
+from .core.gacos import gacos_official_status
 from .core.io import load_stack
 from .core.synthetic import generate_demo_dataset
-from .core.utils import atomic_write_json, format_bytes, read_json
+from .core.utils import atomic_write_json, read_json
 from .params import (
     fingerprint,
     merge_params,
     public_params,
+    require_min_dates,
     validate_params,
     with_atmosphere_defaults,
 )
@@ -31,6 +36,14 @@ from .params import (
 
 SCHEMA = "insar-studio/project/v1"
 TECHNIQUES = ("sbas", "ps", "ds", "dinsar")
+
+
+class InvalidProjectId(ValueError):
+    """Raised when a project identifier cannot name a directory in the store.
+
+    This is a *client* error, not an internal failure.  The HTTP layer maps it
+    to 400 so a malformed URL never turns into a 500 with a stack trace.
+    """
 #: Parameters whose sensible value depends on the selected technique.  They
 #: are restored to that route's defaults when the route changes, unless the
 #: caller explicitly provided a new value in the same request.
@@ -40,7 +53,6 @@ ROUTE_PARAM_KEYS = (
     "max_pairs",
     "ps_star_all",
     "ds_patch",
-    "ds_overlap",
 )
 
 
@@ -62,6 +74,7 @@ _INVERSION_PRODUCTS = (
     "products/exports",
     "products/inversion.json",
     "products/validation.json",
+    "products/geocode.json",
     "products/figures/velocity.png",
     "products/figures/dem_error.png",
     "products/figures/temporal_coherence.png",
@@ -215,17 +228,38 @@ def _default_params(technique: str) -> dict[str, Any]:
     return params
 
 
+#: Sidebar summaries are allowed to lag direct disk writes by this long.
+#: Local mutations (create/save/update/delete/reset) invalidate explicitly;
+#: the TTL only covers products written by an engine job or another process.
+PROJECT_LIST_TTL_SECONDS = 5.0
+
+
 class ProjectStore:
     def __init__(self, root: Path | None = None) -> None:
         self.root = Path(root or PROJECTS_DIR)
         self.root.mkdir(parents=True, exist_ok=True)
+        # ``list()`` used to read every project.json and walk every project
+        # tree on each sidebar refresh.  Two caches keep that bounded:
+        # ``_catalog_cache`` holds the directory scan plus project metadata for
+        # a few seconds, and ``_row_cache`` holds fully computed summary rows
+        # for the pages that were actually requested.  Neither is trusted
+        # across local mutations -- every write helper calls invalidate().
+        self._catalog_cache: tuple[float, list[tuple[dict[str, Any], Path]]] | None = None
+        self._row_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        self._cache_lock = threading.RLock()
+
+    def invalidate(self) -> None:
+        """Drop cached project metadata and summary rows."""
+        with self._cache_lock:
+            self._catalog_cache = None
+            self._row_cache.clear()
 
     def path(self, project_id: str) -> Path:
         if not project_id or any(ch not in "abcdefghijklmnopqrstuvwxyz0123456789_" for ch in project_id.lower()):
-            raise ValueError("非法项目编号")
+            raise InvalidProjectId("非法项目编号")
         path = (self.root / project_id).resolve()
         if self.root.resolve() not in path.parents:
-            raise ValueError("项目路径越界")
+            raise InvalidProjectId("项目路径越界")
         return path
 
     def create(
@@ -260,6 +294,7 @@ class ProjectStore:
             "steps_run": {},
         }
         atomic_write_json(path / "project.json", project)
+        self.invalidate()
         return project
 
     def create_demo(self, name: str, technique: str = "sbas", params: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -276,6 +311,7 @@ class ProjectStore:
         }
         project["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
         atomic_write_json(path / "project.json", project)
+        self.invalidate()
         return project
 
     def get(self, project_id: str) -> dict[str, Any]:
@@ -290,12 +326,24 @@ class ProjectStore:
         if isinstance(project.get("params"), dict):
             project["params"] = public_params(project["params"])
         atomic_write_json(self.path(project["id"]) / "project.json", project)
+        self.invalidate()
         return project
 
     def update(self, project_id: str, patch: dict[str, Any]) -> dict[str, Any]:
         project = self.get(project_id)
         old_technique = str(project.get("technique", "sbas")).lower()
         target_technique = str(patch.get("technique") or old_technique).lower()
+        if target_technique not in TECHNIQUES:
+            raise ValueError(f"未知技术路线: {target_technique}")
+        if "technique" in patch:
+            # A route must not be selected when the imported stack cannot
+            # support it.  An empty project has no stack yet and may still
+            # choose any route before importing data.
+            require_min_dates(
+                target_technique,
+                _stack_n_dates(self.path(project_id)),
+                action="切换到该技术路线",
+            )
         explicit_params = patch.get("params") if isinstance(patch.get("params"), dict) else {}
         if explicit_params:
             explicit_params = validate_params(
@@ -341,26 +389,94 @@ class ProjectStore:
         return saved
 
     def list(self) -> list[dict[str, Any]]:
-        out = []
-        for directory in sorted(self.root.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
-            if not directory.is_dir():
+        """Return all project summaries (CLI and compatibility API)."""
+        return self.list_page()[0]
+
+    def list_page(
+        self,
+        *,
+        offset: int = 0,
+        limit: int | None = None,
+        query: str = "",
+        refresh: bool = False,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Return a filtered/sorted page and the total number of matches.
+
+        Only the requested page is turned into summary rows, so a large project
+        library no longer pays for every project's status and disk size on each
+        sidebar refresh.  Directory metadata and computed rows are cached for
+        :data:`PROJECT_LIST_TTL_SECONDS`; local writes invalidate immediately,
+        and ``refresh=True`` forces a fresh scan.
+        """
+        if refresh:
+            self.invalidate()
+        entries = self._catalog_entries()
+        needle = str(query or "").strip().lower()
+        if needle:
+            entries = [
+                entry
+                for entry in entries
+                if needle in f"{entry[0].get('name', '')} {entry[0].get('id', '')}".lower()
+            ]
+        total = len(entries)
+        start = max(0, int(offset))
+        page = entries[start:]
+        if limit is not None:
+            page = page[: max(0, int(limit))]
+        # Callers (the HTTP layer) annotate rows with the active job; never let
+        # that leak back into the shared cache.
+        return [self._cached_row(project, path) for project, path in page], total
+
+    def _catalog_entries(self) -> list[tuple[dict[str, Any], Path]]:
+        """Return cached ``(project, path)`` pairs, newest directory first."""
+        now = time.monotonic()
+        with self._cache_lock:
+            cached = self._catalog_cache
+            if cached is not None and now - cached[0] < PROJECT_LIST_TTL_SECONDS:
+                return cached[1]
+
+        entries: list[tuple[float, str, dict[str, Any], Path]] = []
+        try:
+            directories = list(self.root.iterdir())
+        except OSError:
+            directories = []
+        for directory in directories:
+            try:
+                if not directory.is_dir():
+                    continue
+                mtime = directory.stat().st_mtime
+            except OSError:
                 continue
             project = read_json(directory / "project.json")
             if not isinstance(project, dict) or not project:
                 continue
-            out.append(self._summary_row(project, directory))
-        return out
+            entries.append((mtime, directory.name, project, directory))
+        entries.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        ordered = [(project, directory) for _, _, project, directory in entries]
+
+        with self._cache_lock:
+            self._catalog_cache = (now, ordered)
+            # Drop rows for projects that no longer exist.
+            alive = {str(project.get("id") or path.name) for project, path in ordered}
+            for project_id in set(self._row_cache) - alive:
+                self._row_cache.pop(project_id, None)
+        return ordered
+
+    def _cached_row(self, project: dict[str, Any], path: Path) -> dict[str, Any]:
+        project_id = str(project.get("id") or path.name)
+        now = time.monotonic()
+        with self._cache_lock:
+            cached = self._row_cache.get(project_id)
+            if cached is not None and now - cached[0] < PROJECT_LIST_TTL_SECONDS:
+                return copy.deepcopy(cached[1])
+        row = self._summary_row(project, path)
+        with self._cache_lock:
+            self._row_cache[project_id] = (now, row)
+        return copy.deepcopy(row)
 
     def _summary_row(self, project: dict[str, Any], path: Path) -> dict[str, Any]:
         project_id = str(project.get("id") or path.name)
         status = self.status(project_id, project)
-        size = 0
-        for p in path.rglob("*"):
-            try:
-                if p.is_file():
-                    size += p.stat().st_size
-            except OSError:
-                pass
         row = {
             "id": project_id,
             "name": str(project.get("name") or "未命名项目"),
@@ -371,8 +487,6 @@ class ProjectStore:
             "steps_done": sum(1 for s in status if s["done"]),
             "steps_total": len(status),
             "stale": any(s.get("stale") for s in status),
-            "size_bytes": size,
-            "size_human": format_bytes(size),
             "status": status,
         }
         stack_meta = _as_dict(read_json(path / "data" / "stack" / "meta.json", {}))
@@ -414,6 +528,7 @@ class ProjectStore:
         network = _as_dict(read_json(path / "data" / "network.json", {}))
         ifg = _as_dict(read_json(path / "interferograms" / "summary.json", {}))
         atm = _as_dict(read_json(path / "data" / "atmosphere" / "atmosphere.json", {}))
+        gacos_manifest = _as_dict(read_json(path / "data" / "gacos" / "official" / "manifest.json", {}))
         inv = _as_dict(read_json(path / "products" / "inversion.json", {}))
 
         def is_stale(key: str) -> bool:
@@ -440,7 +555,19 @@ class ProjectStore:
         ifg_exists = bool(ifg.get("n_pairs"))
         ifg_stale = ifg_exists and (network_stale or is_stale("interferometry"))
         atm_exists = bool(atm)
-        atm_stale = atm_exists and (ifg_stale or is_stale("atmosphere"))
+        # Importing a newer official GACOS archive invalidates an atmosphere
+        # product produced from the previous archive, even though the stage
+        # parameters themselves did not change.
+        gacos_updated = str(gacos_manifest.get("updated_at") or "")
+        atm_created = str(atm.get("created_at") or "")
+        gacos_newer = bool(
+            atm_exists
+            and str(atm.get("source") or "") == "official"
+            and gacos_updated
+            and atm_created
+            and gacos_updated > atm_created
+        )
+        atm_stale = atm_exists and (ifg_stale or is_stale("atmosphere") or gacos_newer)
         inv_exists = bool(inv)
         inv_stale = inv_exists and (atm_stale or is_stale("inversion"))
 
@@ -462,6 +589,8 @@ class ProjectStore:
             if key == "atmosphere":
                 if not atm_exists:
                     return "未处理"
+                if gacos_newer:
+                    return "GACOS 产品已更新，需重跑"
                 if atm_stale:
                     return "上游参数已变更，需重跑"
                 return {"gacos": "GACOS", "empirical": "经验校正", "off": "未校正"}.get(atm.get("method", ""), "已处理")
@@ -529,7 +658,7 @@ class ProjectStore:
                     pass
         return project
 
-    def overview(self, project_id: str) -> dict[str, Any]:
+    def overview(self, project_id: str, *, include_files: bool = False) -> dict[str, Any]:
         path = self.path(project_id)
         project = self.get(project_id)
         status = self.status(project_id, project)
@@ -539,6 +668,15 @@ class ProjectStore:
         ifg = _as_dict(read_json(path / "interferograms" / "summary.json", {}))
         atm = _as_dict(read_json(path / "data" / "atmosphere" / "atmosphere.json", {}))
         inv = _as_dict(read_json(path / "products" / "inversion.json", {}))
+        try:
+            gacos = gacos_official_status(path)
+        except Exception as exc:  # a broken external product must not hide the project
+            gacos = {
+                "official": {"error": str(exc), "exists": False, "n_dates": 0, "n_available": 0},
+                "defaults": {},
+                "limits": {},
+                "formats": {},
+            }
         assets = {}
         for key, rel in (
             ("amplitude", "data/preview_amplitude.png"),
@@ -567,48 +705,67 @@ class ProjectStore:
             "pairs": network.get("pairs", []),
             "interferometry": ifg,
             "atmosphere": atm,
+            "gacos": gacos,
             "inversion": inv,
             "assets": assets,
             "truth_available": (path / "data" / "stack" / "truth.npz").exists(),
-            "files": self.product_files(project_id),
+            # The results step is the only consumer of the file inventory.
+            # Keeping it out of the default overview avoids stat()-ing every
+            # product each time a project is opened.
+            "files": self.product_files(project_id) if include_files else [],
         }
 
     def product_files(self, project_id: str) -> list[dict[str, Any]]:
         path = self.path(project_id)
         products = path / "products"
-        out = []
+        out: list[dict[str, Any]] = []
         if not products.exists():
             return out
-        for p in sorted(products.rglob("*")):
-            if p.suffix.lower() not in (".tif", ".tiff", ".png", ".csv", ".json", ".md", ".docx", ".zip", ".npy"):
-                continue
+        stack = [products]
+        while stack:
+            current = stack.pop()
             try:
-                if not p.is_file():
-                    continue
-                size = p.stat().st_size
-                relative = p.relative_to(path)
-                parts = p.relative_to(products).parts
-                group = parts[0] if len(parts) > 1 else "root"
-            except (OSError, ValueError):
-                # A running job can remove a product between directory
-                # enumeration and stat().  Such a file is simply no longer part
-                # of the result set; it must not turn the whole project into a
-                # misleading 404.
+                with os.scandir(current) as entries:
+                    for entry in entries:
+                        try:
+                            info = entry.stat(follow_symlinks=False)
+                        except OSError:
+                            continue
+                        if stat_module.S_ISDIR(info.st_mode):
+                            stack.append(Path(entry.path))
+                            continue
+                        if not stat_module.S_ISREG(info.st_mode):
+                            continue
+                        suffix = os.path.splitext(entry.name)[1].lower()
+                        if suffix not in (".tif", ".tiff", ".png", ".csv", ".json", ".md", ".docx", ".zip", ".npy"):
+                            continue
+                        item = Path(entry.path)
+                        try:
+                            relative = item.relative_to(path)
+                            parts = item.relative_to(products).parts
+                            group = parts[0] if len(parts) > 1 else "root"
+                        except ValueError:
+                            continue
+                        out.append(
+                            {
+                                "path": str(relative).replace("\\", "/"),
+                                "name": entry.name,
+                                "size": info.st_size,
+                                "group": group,
+                            }
+                        )
+            except OSError:
+                # A running job can remove a directory between enumeration and
+                # descent.  Skip it instead of failing the whole overview.
                 continue
-            out.append(
-                {
-                    "path": str(relative).replace("\\", "/"),
-                    "name": p.name,
-                    "size": size,
-                    "group": group,
-                }
-            )
+        out.sort(key=lambda item: item["path"])
         return out
 
     def delete(self, project_id: str) -> None:
         path = self.path(project_id)
         if path.exists():
             shutil.rmtree(path, ignore_errors=False)
+        self.invalidate()
 
     def stack_preview(self, project_id: str) -> dict[str, Any]:
         path = self.path(project_id)

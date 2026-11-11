@@ -3,9 +3,11 @@
 Three routes are supported:
 
 ``gacos``
-    External GACOS zenith delay products (demo, local files or an online
-    adapter).  The per-date delay is converted to LOS and differentiated for
-    every interferometric pair.
+    External GACOS zenith delay products.  Four sources are supported: the
+    official asynchronous service (imported tar.gz / email links), demo
+    screens, a local directory, or a custom synchronous online adapter.  The
+    per-date delay is converted to LOS and differentiated for every
+    interferometric pair.
 ``empirical``
     A robust phase-elevation regression per pair, optionally including a
     long-wavelength plane.  This is the classic stratified-troposphere
@@ -312,7 +314,12 @@ def correct_gacos(
         "screen_std_mm": float(np.nanstd(screen_stack)),
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "note": info.get("note", "GACOS LOS delay differenced per interferometric pair."),
+        "warnings": list(info.get("warnings") or []),
+        "missing_dates": list(info.get("missing_dates") or []),
     }
+    if info.get("source") == "official":
+        summary["directory"] = info.get("directory")
+        summary["reference"] = "GACOS official products imported into the project"
     summary = _save_corrected(root, pairs, corrected, masks, raw, screen_stack, stack.dates, summary)
     truth = _truth_diagnostics(
         root,

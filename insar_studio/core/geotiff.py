@@ -65,9 +65,56 @@ def write_geotiff(
         photometric="minisblack",
         metadata=None,
         extratags=extratags,
-        compression="zlib" if compress else None,
+        # PackBits is decoded by every TIFF reader and needs no optional
+        # codec.  The imagecodecs build shipped with some environments
+        # mis-encodes zlib/deflate, producing files that cannot be read back.
+        compression="packbits" if compress else None,
     )
     return path
+
+
+def _geo_from_tags(tags: dict[str, Any]) -> dict[str, Any]:
+    geo: dict[str, Any] = {"crs": "EPSG:4326"}
+    scale = tags.get("ModelPixelScaleTag")
+    tie = tags.get("ModelTiepointTag")
+    if scale and tie:
+        geo["lon_step"] = float(scale[0])
+        geo["lat_step"] = -float(scale[1])
+        geo["corner_lon"] = float(tie[3])
+        geo["corner_lat"] = float(tie[4])
+    keys = tags.get("GeoKeyDirectoryTag")
+    if keys:
+        # crude extraction of GeographicTypeGeoKey
+        arr_keys = list(keys)
+        for i in range(4, len(arr_keys), 4):
+            if arr_keys[i] == GEOGRAPHIC_TYPE:
+                geo["epsg"] = int(arr_keys[i + 3])
+    return geo
+
+
+def _normalise_shape(shape: tuple[int, ...], dtype: np.dtype) -> tuple[int, ...]:
+    """Collapse the two-band (I, Q) layouts accepted by :func:`read_geotiff`."""
+    if len(shape) == 3 and shape[-1] == 2 and dtype != np.complex64:
+        return tuple(shape[:-1])
+    if len(shape) == 3 and shape[0] == 1:
+        return tuple(shape[1:])
+    return tuple(shape)
+
+
+def probe_geotiff(path: Path) -> tuple[tuple[int, ...], np.dtype, dict[str, Any]]:
+    """Return shape, dtype and georeference without decoding image pixels.
+
+    This is used by the import preflight to validate a large stack without
+    reading every scene into memory.
+    """
+    path = Path(path)
+    with tifffile.TiffFile(path) as tif:
+        page = tif.pages[0]
+        shape = _normalise_shape(tuple(int(v) for v in page.shape), np.dtype(page.dtype))
+        dtype = np.dtype(page.dtype)
+        tags = {tag.name: tag.value for tag in page.tags.values()}
+        geo = _geo_from_tags(tags)
+    return shape, dtype, geo
 
 
 def read_geotiff(path: Path, *, mmap: bool = False) -> tuple[np.ndarray, dict[str, Any]]:
@@ -77,21 +124,7 @@ def read_geotiff(path: Path, *, mmap: bool = False) -> tuple[np.ndarray, dict[st
         page = tif.pages[0]
         arr = page.asarray()
         tags = {tag.name: tag.value for tag in page.tags.values()}
-        geo: dict[str, Any] = {"crs": "EPSG:4326"}
-        scale = tags.get("ModelPixelScaleTag")
-        tie = tags.get("ModelTiepointTag")
-        if scale and tie:
-            geo["lon_step"] = float(scale[0])
-            geo["lat_step"] = -float(scale[1])
-            geo["corner_lon"] = float(tie[3])
-            geo["corner_lat"] = float(tie[4])
-        keys = tags.get("GeoKeyDirectoryTag")
-        if keys:
-            # crude extraction of GeographicTypeGeoKey
-            arr_keys = list(keys)
-            for i in range(4, len(arr_keys), 4):
-                if arr_keys[i] == GEOGRAPHIC_TYPE:
-                    geo["epsg"] = int(arr_keys[i + 3])
+        geo = _geo_from_tags(tags)
     if arr.ndim == 3 and arr.shape[-1] == 2 and arr.dtype != np.complex64:
         arr = arr[..., 0] + 1j * arr[..., 1]
     if arr.ndim == 3 and arr.shape[0] == 1:

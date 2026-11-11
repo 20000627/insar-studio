@@ -75,8 +75,45 @@ def _venv_python() -> Path:
     return VENV / "bin" / "python"
 
 
+def _python_is_supported(python: Path | str) -> bool:
+    """Return True for a 64-bit Python 3.9+ interpreter."""
+    try:
+        probe = subprocess.run(
+            [
+                str(python),
+                "-c",
+                "import sys, struct; raise SystemExit(0 if sys.version_info >= (3, 9) and struct.calcsize('P') * 8 == 64 else 1)",
+            ],
+            capture_output=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return probe.returncode == 0
+
+
+def _venv_dependencies_ready(python: Path) -> bool:
+    try:
+        probe = subprocess.run(
+            [
+                str(python),
+                "-c",
+                "import numpy, scipy, skimage, matplotlib, flask, tifffile, docx, requests",
+            ],
+            capture_output=True,
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return probe.returncode == 0
+
+
 def _install_into_venv(no_install: bool) -> Path:
     python = _venv_python()
+    if python.exists() and not _python_is_supported(python):
+        _say("[ERROR] 现有 .venv 不是 64 位 Python 3.9+。")
+        _say("请删除项目目录下的 .venv 后重新运行 start.bat。")
+        raise SystemExit(3)
     if not python.exists():
         _say("首次运行：正在创建本地 Python 环境 .venv ...")
         if no_install:
@@ -113,11 +150,18 @@ def main(argv: list[str] | None = None) -> int:
         _say(f"[ERROR] 需要 Python 3.9 或更高版本，当前为 {sys.version.split()[0]}。")
         _say("请从 https://www.python.org/downloads/ 安装，并勾选 Add python.exe to PATH。")
         return 2
+    if sys.maxsize <= 2**32:
+        _say("[ERROR] 需要 64 位 Python；当前解释器是 32 位，无法安装 NumPy/SciPy 轮子。")
+        _say("请安装 64 位 Python 3.11，并重新运行 start.bat。")
+        return 2
+    if sys.version_info[:2] > (3, 11):
+        _say(f"[提示] 当前 Python {sys.version.split()[0]} 高于已验证的 3.11；如果依赖安装失败，请改用 Python 3.11。")
     if not REQUIREMENTS.exists():
         _say(f"[ERROR] 找不到 {REQUIREMENTS}")
         return 2
 
     parser = argparse.ArgumentParser(add_help=True)
+    parser.add_argument("--check", action="store_true", help="只检查环境与依赖，不启动服务")
     parser.add_argument("--no-install", action="store_true", help="依赖缺失时不要自动创建虚拟环境")
     parser.add_argument("--no-browser", action="store_true", help="不自动打开浏览器")
     parser.add_argument("--port", type=int, default=None, help="指定端口（默认自动选择 8765 起）")
@@ -125,6 +169,22 @@ def main(argv: list[str] | None = None) -> int:
     known, passthrough = parser.parse_known_args(argv)
 
     missing = _missing_dependencies()
+    if known.check:
+        venv_python = _venv_python()
+        if (
+            missing
+            and venv_python.exists()
+            and _python_is_supported(venv_python)
+            and _venv_dependencies_ready(venv_python)
+        ):
+            _say("环境检查通过：使用现有 .venv，依赖完整。")
+            return 0
+        if missing:
+            _say("环境检查：当前解释器缺少依赖: " + ", ".join(missing))
+            _say("运行 start.bat（或 python scripts/bootstrap.py）可自动创建 .venv 并安装。")
+            return 3
+        _say(f"环境检查通过：Python {sys.version.split()[0]}，依赖完整。")
+        return 0
     if missing:
         _say("检测到缺失依赖: " + ", ".join(missing))
         python = _install_into_venv(known.no_install)

@@ -13,10 +13,13 @@ from typing import Any
 
 import numpy as np
 
+from .config import TECHNIQUES
+from .core.geocode import geocode_readiness
 from .core.utils import format_bytes, read_json
 from .params import (
     fingerprint,
     merge_params,
+    min_dates_for,
     validate_params,
     with_atmosphere_defaults,
 )
@@ -48,6 +51,44 @@ def _dir_size(path: Path) -> int:
 
 def _dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
+
+
+def _flag(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value).strip().lower() in {"1", "true", "yes", "on", "y", "是"}
+
+
+def _add_geocoding_check(add, root: Path, meta: dict[str, Any]) -> None:
+    status = read_json(root / "products" / "geocode.json", {})
+    if isinstance(status, dict) and status:
+        state = str(status.get("status", "")).lower()
+        coverage = status.get("coverage")
+        if state in ("done", "partial"):
+            detail = "已输出地图坐标 GeoTIFF"
+            if coverage is not None:
+                try:
+                    detail += f" · 覆盖 {float(coverage):.1%}"
+                except (TypeError, ValueError):
+                    pass
+            if state == "partial":
+                detail += "；地图网格与雷达覆盖仅部分相交"
+            add(_check("geocoding", "地理编码", "ok" if state == "done" else "warn", detail))
+            return
+        reasons = status.get("reasons") or []
+        detail = "未输出地图坐标 GeoTIFF"
+        if reasons:
+            detail += f"：{reasons[0]}"
+        add(_check("geocoding", "地理编码", "warn", detail, "data"))
+        return
+    ready = geocode_readiness(meta, root)
+    if ready.get("ready"):
+        add(_check("geocoding", "地理编码", "ok", "轨道与时间元数据齐全，反演后可输出地图坐标 GeoTIFF"))
+    else:
+        reasons = ready.get("reasons") or ["元数据不足"]
+        add(_check("geocoding", "地理编码", "warn", f"无法地理编码：{reasons[0]}；成果仅在雷达坐标", "data"))
 
 
 def diagnose_project(root: Path) -> dict[str, Any]:
@@ -102,6 +143,32 @@ def diagnose_project(root: Path) -> dict[str, Any]:
         else:
             add(_check("stack_meta", "数据元信息", "ok", f"{n_dates} 景 · {rows} × {cols} 像元"))
 
+        try:
+            required_dates = min_dates_for(technique)
+        except Exception:
+            required_dates = None
+        if n_dates and required_dates is not None:
+            route_label = str(TECHNIQUES.get(technique, {}).get("name") or technique.upper())
+            if n_dates < required_dates:
+                add(
+                    _check(
+                        "route_dates",
+                        "路线影像数",
+                        "error",
+                        f"{route_label} 至少需要 {required_dates} 景影像，当前仅 {n_dates} 景",
+                        "data",
+                    )
+                )
+            else:
+                add(
+                    _check(
+                        "route_dates",
+                        "路线影像数",
+                        "ok",
+                        f"{route_label} 需要 ≥ {required_dates} 景，当前 {n_dates} 景",
+                    )
+                )
+
         if n_dates and len(dates) == n_dates:
             shape = _npy_shape(slc_file) if slc_file.exists() else None
             expected = (n_dates, rows, cols)
@@ -118,12 +185,117 @@ def diagnose_project(root: Path) -> dict[str, Any]:
             if not np.isfinite(value) or value <= 0:
                 add(_check(f"meta_{key}", f"元信息 · {label}", "error", f"{key} 无效", "data"))
 
-        try:
-            bperp = np.asarray(meta.get("bperp") or [], dtype=float)
-            if bperp.size and np.nanmax(np.abs(bperp)) < 1e-6:
-                add(_check("baseline", "垂直基线", "warn", "所有垂直基线为 0，DEM 误差无法估计", "data"))
-        except Exception:
-            add(_check("baseline", "垂直基线", "warn", "垂直基线格式异常", "data"))
+        if n_dates:
+            raw_bperp = meta.get("bperp_m")
+            legacy = False
+            if raw_bperp is None:
+                # Older imported metadata used ``bperp``.  Keep reading it for
+                # compatibility, but never let a missing/non-canonical field
+                # silently disable this check.
+                raw_bperp = meta.get("bperp")
+                legacy = raw_bperp is not None
+            try:
+                bperp = np.asarray(raw_bperp if raw_bperp is not None else [], dtype=float).ravel()
+                if bperp.size == 0:
+                    add(_check("baseline", "垂直基线", "warn", "缺少 bperp_m，DEM 误差与基线筛选不可用", "data"))
+                elif bperp.size != n_dates:
+                    add(
+                        _check(
+                            "baseline",
+                            "垂直基线",
+                            "warn",
+                            f"bperp_m 数量为 {bperp.size}，与影像数量 {n_dates} 不一致",
+                            "data",
+                        )
+                    )
+                elif not np.all(np.isfinite(bperp)):
+                    add(_check("baseline", "垂直基线", "warn", "bperp_m 含非有限值", "data"))
+                elif float(np.nanmax(np.abs(bperp))) < 1e-6:
+                    add(_check("baseline", "垂直基线", "warn", "所有垂直基线为 0，DEM 误差无法估计", "data"))
+                else:
+                    suffix = "（兼容旧字段 bperp）" if legacy else ""
+                    source = str(meta.get("baseline_source", "")).lower()
+                    if source == "orbit":
+                        suffix += "，由本地精密轨道估计"
+                    add(
+                        _check(
+                            "baseline",
+                            "垂直基线",
+                            "ok",
+                            f"范围 {float(np.nanmin(bperp)):+.1f} – {float(np.nanmax(bperp)):+.1f} m{suffix}",
+                        )
+                    )
+            except (TypeError, ValueError):
+                add(_check("baseline", "垂直基线", "warn", "垂直基线格式异常", "data"))
+
+    if meta:
+        explicit_geo = meta.get("geo_referenced")
+        if explicit_geo is None:
+            try:
+                geo_ok = (
+                    abs(float(meta.get("corner_lon", 0.0))) > 1e-9
+                    or abs(float(meta.get("corner_lat", 0.0))) > 1e-9
+                )
+            except (TypeError, ValueError):
+                geo_ok = False
+        else:
+            geo_ok = _flag(explicit_geo)
+        if geo_ok:
+            try:
+                west = float(meta.get("corner_lon", 0.0))
+                north = float(meta.get("corner_lat", 0.0))
+                add(
+                    _check(
+                        "geo_reference",
+                        "地理参考",
+                        "ok",
+                        f"左上角 {west:.5f}, {north:.5f} · {meta.get('crs', 'EPSG:4326')}",
+                    )
+                )
+            except (TypeError, ValueError):
+                add(_check("geo_reference", "地理参考", "warn", "地理参考字段无法解析", "data"))
+        else:
+            add(
+                _check(
+                    "geo_reference",
+                    "地理参考",
+                    "warn",
+                    "缺少 corner_lon/corner_lat，成果按像元坐标输出，无法直接叠加到 GIS",
+                    "data",
+                )
+            )
+        if str(meta.get("dates_source", "")).lower() == "inferred":
+            add(
+                _check(
+                    "dates_source",
+                    "日期完整性",
+                    "warn",
+                    "部分日期由系统按 12 天间隔推断，时间基线可能失真",
+                    "data",
+                )
+            )
+        if _flag(meta.get("already_coregistered")):
+            coreg_file = root / "data" / "processed" / "slc_coreg.npy"
+            if coreg_file.exists():
+                add(
+                    _check(
+                        "pre_coregistered",
+                        "预配准栈",
+                        "ok",
+                        "导入时已标记为已配准，流水线跳过二次配准",
+                    )
+                )
+            else:
+                add(
+                    _check(
+                        "pre_coregistered",
+                        "预配准栈",
+                        "error",
+                        "标记为已配准，但缺少 data/processed/slc_coreg.npy，流水线会重新配准",
+                        "data",
+                    )
+                )
+        _add_geocoding_check(add, root, meta)
 
     if dem_file.exists():
         try:

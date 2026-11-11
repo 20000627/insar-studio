@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Callable
 
@@ -12,11 +13,13 @@ from scipy import ndimage
 from ..config import DEFAULT_PROCESSING
 from .filters import filter_complex
 from .io import load_stack, safe_join
+from .memory import MIB, choose_block_rows
+from .memory import ensure_memory_budget, estimate_interferometry_peak
 from .plotting import save_raster, save_wrapped_phase
 from .unwrapping import unwrap
 from .utils import (
     atomic_write_json,
-    downsample_complex,
+    downsample_complex_pair,
     downsample_real,
     json_safe,
     read_json,
@@ -53,9 +56,23 @@ def reference_pixel(
     """Select a stable, high-quality reference pixel near the scene centre."""
     n = coreg.shape[0]
     step = max(1, n // 8)
-    amp_stack = np.asarray([np.abs(coreg[i]) for i in range(0, n, step)], dtype=np.float32)
-    mean_amp = amp_stack.mean(axis=0)
-    adi = amp_stack.std(axis=0) / np.maximum(mean_amp, 1e-6)
+    # Accumulate first and second amplitude moments instead of stacking up to
+    # eight full-resolution images.  On a 10000 x 10000 scene the old stack
+    # alone needed about 3.2 GiB.
+    mean_amp = np.zeros(coreg.shape[1:], dtype=np.float32)
+    mean_sq = np.zeros(coreg.shape[1:], dtype=np.float32)
+    count = 0
+    for i in range(0, n, step):
+        amp = np.abs(np.asarray(coreg[i])).astype(np.float32)
+        mean_amp += amp
+        mean_sq += amp * amp
+        count += 1
+    if count == 0:
+        raise RuntimeError("SLC 栈为空，无法选择参考像元")
+    mean_amp /= count
+    mean_sq /= count
+    variance = np.maximum(mean_sq - mean_amp * mean_amp, 0.0)
+    adi = (np.sqrt(variance) / np.maximum(mean_amp, 1e-6)).astype(np.float32)
     adi_m = downsample_real(adi, multilook)
     mask_m = _downsample_mask(mask, multilook)
     quality = 1.0 / (adi_m + 0.03)
@@ -70,28 +87,65 @@ def reference_pixel(
     return int(row), int(col), info
 
 
-def _remove_plane(phase: np.ndarray, coherence: np.ndarray, valid: np.ndarray) -> tuple[np.ndarray, dict[str, Any]]:
+def _remove_ramp(
+    phase: np.ndarray,
+    coherence: np.ndarray,
+    valid: np.ndarray,
+    *,
+    order: int = 1,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Fit and remove a low-order polynomial ramp from unwrapped phase.
+
+    ``order=1`` removes ``a*x + b*y + c``; ``order=2`` additionally removes
+    ``d*x² + e*y² + f*x*y``.  The fit uses high-coherence pixels only so that
+    noisy or decorrelated areas do not bias the ramp.
+    """
     rows, cols = phase.shape
-    yy, xx = np.mgrid[0:rows, 0:cols]
+    order = 2 if int(order) >= 2 else 1
     good = valid & (coherence >= 0.55) & np.isfinite(phase)
     idx = np.flatnonzero(good.ravel())
     if idx.size < 200:
-        return phase, {"removed": False}
+        return phase, {"removed": False, "order": order, "reason": "有效高相干像元不足"}
     if idx.size > 12000:
         idx = np.random.default_rng(7).choice(idx, 12000, replace=False)
-    x = (xx.ravel()[idx] / max(cols - 1, 1)) - 0.5
-    y = (yy.ravel()[idx] / max(rows - 1, 1)) - 0.5
+    # Only the sampled pixels need coordinates; a full mgrid for a large scene
+    # would allocate two int64 arrays over the whole image.
+    jr, jc = np.unravel_index(idx, (rows, cols))
+    x = (jc / max(cols - 1, 1)) - 0.5
+    y = (jr / max(rows - 1, 1)) - 0.5
     z = phase.ravel()[idx]
-    A = np.column_stack([x, y, np.ones_like(x)])
+    columns = [x, y, np.ones_like(x)]
+    names = ["x", "y", "intercept"]
+    if order >= 2:
+        columns.extend([x * x, y * y, x * y])
+        names.extend(["x2", "y2", "xy"])
+    A = np.column_stack(columns)
     coef, *_ = np.linalg.lstsq(A, z, rcond=None)
-    ramp = coef[0] * ((xx / max(cols - 1, 1)) - 0.5) + coef[1] * ((yy / max(rows - 1, 1)) - 0.5)
-    out = (phase - ramp).astype(np.float32)
+    # Subtract the low-order surface in row blocks so the float64 ramp never
+    # exists as a full-image array.
+    xn = (np.arange(cols, dtype=np.float64) / max(cols - 1, 1)) - 0.5
+    xn2 = xn * xn
+    out = np.array(phase, dtype=np.float32, copy=True)
+    block_rows = choose_block_rows(rows, cols, budget_bytes=64 * MIB, arrays=4, itemsize=8)
+    for r0 in range(0, rows, block_rows):
+        r1 = min(rows, r0 + block_rows)
+        yn = (np.arange(r0, r1, dtype=np.float64) / max(rows - 1, 1))[:, None] - 0.5
+        term = coef[0] * xn[None, :] + coef[1] * yn + coef[2]
+        if order >= 2:
+            term += coef[3] * xn2[None, :] + coef[4] * yn * yn + coef[5] * xn[None, :] * yn
+        out[r0:r1] = (phase[r0:r1] - term).astype(np.float32)
     return out, {
         "removed": True,
-        "slope_x_rad": float(coef[0]),
-        "slope_y_rad": float(coef[1]),
-        "intercept_rad": float(coef[2]),
+        "order": order,
+        "terms": names,
+        "coefficients": {name: float(value) for name, value in zip(names, coef)},
+        "n_fit_pixels": int(idx.size),
     }
+
+
+def _remove_plane(phase: np.ndarray, coherence: np.ndarray, valid: np.ndarray) -> tuple[np.ndarray, dict[str, Any]]:
+    """Backward-compatible plane-only ramp removal."""
+    return _remove_ramp(phase, coherence, valid, order=1)
 
 
 def _save_pair_figures(
@@ -148,12 +202,18 @@ def process_pair(
     sec_full = np.asarray(coreg[j])
     rows = ref_full.shape[0] // m * m
     cols = ref_full.shape[1] // m * m
-    ref = ref_full[:rows, :cols]
-    sec = sec_full[:rows, :cols]
-    ifg_full = sec * np.conj(ref)
-    ifg = downsample_complex(ifg_full, m)
-    ref_m = downsample_complex(ref, m)
-    sec_m = downsample_complex(sec, m)
+    if m > 1:
+        ifg, ref_m, sec_m = downsample_complex_pair(
+            ref_full[:rows, :cols],
+            sec_full[:rows, :cols],
+            m,
+        )
+    else:
+        ref = ref_full[:rows, :cols]
+        sec = sec_full[:rows, :cols]
+        ifg = sec * np.conj(ref)
+        ref_m = ref
+        sec_m = sec
     ref_amp = np.abs(ref_m).astype(np.float32)
     sec_amp = np.abs(sec_m).astype(np.float32)
 
@@ -209,7 +269,12 @@ def process_pair(
 
     ramp_info = {"removed": False}
     if p.get("remove_ramp", True):
-        unwrapped, ramp_info = _remove_plane(unwrapped, coh, valid)
+        unwrapped, ramp_info = _remove_ramp(
+            unwrapped,
+            coh,
+            valid,
+            order=int(p.get("ramp_order", 1)),
+        )
 
     disp_mm = (unwrapped * wavelength / (4.0 * np.pi) * 1000.0).astype(np.float32)
     valid_out = valid & np.isfinite(unwrapped)
@@ -247,6 +312,7 @@ def process_pair(
             "coherence_window": p.get("coherence_window"),
             "min_coherence": p.get("min_coherence"),
             "remove_ramp": p.get("remove_ramp"),
+            "ramp_order": int(p.get("ramp_order", 1)) if p.get("remove_ramp", True) else None,
         },
         "processing_time": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
@@ -275,6 +341,7 @@ def process_interferograms(
         raise FileNotFoundError("尚未生成干涉网络，请先在「网络」页创建网络")
     pairs = network["pairs"]
     m = max(1, int(p.get("multilook", 2)))
+    ensure_memory_budget(estimate_interferometry_peak(stack.rows, stack.cols, m), "干涉")
     ref_row, ref_col, ref_info = reference_pixel(
         coreg, stack.mask, m, ref_index=int(network.get("stats", {}).get("ref_index", 0))
     )
@@ -323,16 +390,24 @@ def process_interferograms(
 
 def _closure_stats(root: Path, pairs: list[dict[str, Any]], metas: list[dict[str, Any]]) -> dict[str, Any]:
     by_id = {(int(p["ref"]), int(p["sec"])): p for p in pairs}
-    wrapped_cache: dict[tuple[int, int], np.ndarray] = {}
+    # A small LRU keeps a triangle's three arrays hot without retaining every
+    # wrapped product.  On large networks the old unbounded cache could hold
+    # hundreds of full-resolution arrays in RAM.
+    wrapped_cache: OrderedDict[tuple[int, int], np.ndarray] = OrderedDict()
+    max_cached = 6
 
     def get(pair: tuple[int, int]) -> np.ndarray | None:
         if pair not in by_id:
             return None
-        if pair not in wrapped_cache:
-            path = root / "interferograms" / by_id[pair]["id"] / "wrapped.npy"
-            if not path.exists():
-                return None
-            wrapped_cache[pair] = np.load(path, allow_pickle=False)
+        if pair in wrapped_cache:
+            wrapped_cache.move_to_end(pair)
+            return wrapped_cache[pair]
+        path = root / "interferograms" / by_id[pair]["id"] / "wrapped.npy"
+        if not path.exists():
+            return None
+        wrapped_cache[pair] = np.load(path, allow_pickle=False)
+        while len(wrapped_cache) > max_cached:
+            wrapped_cache.popitem(last=False)
         return wrapped_cache[pair]
 
     closures = []

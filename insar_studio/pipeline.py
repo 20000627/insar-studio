@@ -20,7 +20,13 @@ from .core.inversion import run_inversion
 from .core.io import load_stack
 from .core.network import build_network, persist_network
 from .core.utils import atomic_write_json, read_json
-from .params import fingerprint, merge_params, validate_params, with_atmosphere_defaults
+from .params import (
+    fingerprint,
+    merge_params,
+    require_min_dates,
+    validate_params,
+    with_atmosphere_defaults,
+)
 from .project import purge_downstream
 
 
@@ -64,6 +70,19 @@ def _mark_step(
 
 
 def run_coregistration(root: Path, params: dict[str, Any], progress=None) -> dict[str, Any]:
+    stack = load_stack(root)
+    coreg_path = root / "data" / "processed" / "slc_coreg.npy"
+    if bool(stack.meta.get("already_coregistered")) and coreg_path.exists():
+        # The import already supplied a coregistered stack.  Re-estimating
+        # transforms would resample it a second time and silently degrade the
+        # phases, so the explicit coregistration stage becomes a no-op.
+        result = read_json(root / "data" / "processed" / "coreg.json", {}) or {}
+        result["skipped"] = True
+        result["skip_reason"] = "导入时已标记为已配准，未执行二次配准"
+        _mark_step(root, "coregistration", result, params=params)
+        if progress:
+            progress(1.0, "导入时已配准，跳过二次配准")
+        return result
     purge_downstream(root, "coregistration")
     result = coregister_stack(root, params, progress=progress)
     _mark_step(root, "coregistration", result, params=params)
@@ -77,11 +96,19 @@ def run_network(root: Path, technique: str, params: dict[str, Any], progress=Non
     purge_downstream(root, "network")
     coreg_path = root / "data" / "processed" / "slc_coreg.npy"
     coreg_done = coreg_path.exists()
+    pre_coregistered = bool(stack.meta.get("already_coregistered")) and coreg_done
     net_progress = progress
     project = read_json(root / "project.json", {}) or {}
     coreg_hash = (project.get("steps_run", {}).get("coregistration") or {}).get("params_hash")
-    coreg_stale = bool(coreg_hash) and coreg_hash != fingerprint(params, stage="coregistration")
-    if not coreg_done or coreg_stale:
+    coreg_stale = (
+        bool(coreg_hash)
+        and coreg_hash != fingerprint(params, stage="coregistration")
+        and not pre_coregistered
+    )
+    if pre_coregistered:
+        if progress:
+            progress(0.02, "导入时已配准，跳过二次配准")
+    elif not coreg_done or coreg_stale:
         # The wizard exposes network as the first processing step after data
         # loading.  Coregistration is a required precursor, so run it here
         # instead of failing later in interferometry.  Re-run it when the
@@ -205,6 +232,15 @@ def run_pipeline(
     root = Path(project_root)
     project = read_json(root / "project.json", {}) or {}
     technique = (technique or project.get("technique", "sbas")).lower()
+    stack_meta = read_json(root / "data" / "stack" / "meta.json", {}) or {}
+    try:
+        n_dates = int(stack_meta.get("n_dates") or 0) or None
+    except (TypeError, ValueError):
+        n_dates = None
+    # Enforce the route's minimum acquisition count before any stage starts.
+    # This is the last line of defence for direct Python callers; the API and
+    # importer reject the same situation earlier with a 400 response.
+    require_min_dates(technique, n_dates, action="运行该技术路线的全流程")
     # Normalise once at the boundary.  Stage fingerprints must see the same
     # numeric types and default keys regardless of whether the caller is the
     # HTTP API, the CLI, or a direct Python invocation.

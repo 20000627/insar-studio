@@ -113,6 +113,50 @@ def downsample_real(arr: np.ndarray, factor: int) -> np.ndarray:
     return cropped.reshape(rows // factor, factor, cols // factor, factor).mean(axis=(1, 3))
 
 
+def downsample_complex_pair(
+    ref: np.ndarray,
+    sec: np.ndarray,
+    factor: int,
+    *,
+    block_budget_bytes: int = 256 * 1024 * 1024,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Multilook a complex pair in row blocks.
+
+    Returns ``(ifg, ref_m, sec_m)``.  The block loop avoids materialising
+    full-resolution ``ref``, ``sec`` and ``ifg`` copies at the same time, which
+    is the main peak-memory spike when a pair is much larger than RAM.
+    """
+    factor = max(1, int(factor))
+    if factor <= 1:
+        return np.asarray(sec) * np.conj(np.asarray(ref)), ref, sec
+    from .memory import choose_block_rows
+
+    rows = ref.shape[0] // factor * factor
+    cols = ref.shape[1] // factor * factor
+    out_shape = (rows // factor, cols // factor)
+    ifg = np.empty(out_shape, dtype=np.complex64)
+    ref_m = np.empty(out_shape, dtype=np.complex64)
+    sec_m = np.empty(out_shape, dtype=np.complex64)
+    block_rows = choose_block_rows(
+        rows,
+        cols,
+        budget_bytes=max(16 * 1024 * 1024, int(block_budget_bytes)),
+        arrays=3,
+        itemsize=8,
+        multiple=factor,
+    )
+    for r0 in range(0, rows, block_rows):
+        r1 = min(rows, r0 + block_rows)
+        a = np.asarray(ref[r0:r1, :cols])
+        b = np.asarray(sec[r0:r1, :cols])
+        out_r0 = r0 // factor
+        out_r1 = r1 // factor
+        ifg[out_r0:out_r1] = downsample_complex(b * np.conj(a), factor)
+        ref_m[out_r0:out_r1] = downsample_complex(a, factor)
+        sec_m[out_r0:out_r1] = downsample_complex(b, factor)
+    return ifg, ref_m, sec_m
+
+
 def upsample_nearest(arr: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
     rows, cols = shape
     rr = np.minimum((np.arange(rows) * arr.shape[0] // rows), arr.shape[0] - 1)
@@ -145,7 +189,12 @@ def json_safe(obj: Any) -> Any:
 
 def atomic_write_json(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(json_safe(data), ensure_ascii=False, indent=2)
+    # Sanitise at the final write boundary: every stage summary, job record and
+    # cache file goes through this helper, so a stage that accidentally copies
+    # request parameters cannot persist a GACOS token or download password.
+    from ..params import redact_secrets
+
+    payload = json.dumps(redact_secrets(json_safe(data)), ensure_ascii=False, indent=2)
     fd, tmp = tempfile.mkstemp(prefix=".tmp_", suffix=".json", dir=str(path.parent))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:

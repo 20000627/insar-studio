@@ -34,11 +34,60 @@ from .utils import (
 
 Progress = Callable[[float, str], None]
 
+#: Upper bound for one block of the complex covariance matrix.  The previous
+#: implementation kept the full ``(n, n, rows, cols)`` matrix in memory, which
+#: grows quadratically with the number of dates; the block size keeps this
+#: buffer bounded while preserving the same sliding-window covariance.
+COVARIANCE_BUDGET_BYTES = 256 * 1024 * 1024
+
+#: Upper bound for the per-chunk eigendecomposition work arrays.
+EIGEN_BUDGET_BYTES = 64 * 1024 * 1024
+
+
+def _covariance_block_rows(
+    n_dates: int,
+    rows: int,
+    cols: int,
+    budget_bytes: int = COVARIANCE_BUDGET_BYTES,
+) -> int:
+    """Return a row-block height that keeps one covariance block in budget."""
+    if n_dates <= 0 or rows <= 0 or cols <= 0:
+        return 1
+    bytes_per_row = max(1, n_dates * n_dates * cols * np.dtype(np.complex64).itemsize)
+    return max(1, min(int(rows), int(budget_bytes // bytes_per_row)))
+
+
+def _eigen_chunk_size(n_dates: int, budget_bytes: int = EIGEN_BUDGET_BYTES) -> int:
+    """Return how many pixels to decompose at once."""
+    bytes_per_pixel = max(1, n_dates * n_dates * np.dtype(np.complex128).itemsize)
+    return max(1, int(budget_bytes // bytes_per_pixel))
+
 
 def _filter_covariance(prod: np.ndarray, size: int) -> np.ndarray:
     real = ndimage.uniform_filter(prod.real, size=size, mode="nearest")
     imag = ndimage.uniform_filter(prod.imag, size=size, mode="nearest")
     return (real + 1j * imag).astype(np.complex64)
+
+
+def pair_coherence(
+    slc: np.ndarray,
+    diag: np.ndarray,
+    sec: int,
+    ref: int,
+    patch: int,
+) -> np.ndarray:
+    """Compute the local coherence of one pair from the linked DS stack.
+
+    The full covariance matrix is deliberately not retained; this helper
+    recomputes one pair at a time so memory stays proportional to a single
+    multilooked grid.
+    """
+    prod = slc[sec] * np.conj(slc[ref])
+    c = _filter_covariance(prod, patch)
+    c /= np.maximum(np.sqrt(diag[sec] * diag[ref]), 1e-9)
+    c.real = np.clip(c.real, -1.0, 1.0)
+    c.imag = np.clip(c.imag, -1.0, 1.0)
+    return np.clip(np.abs(c), 0.0, 1.0).astype(np.float32)
 
 
 def phase_link(
@@ -51,7 +100,12 @@ def phase_link(
     ref_index: int = 0,
     progress: Progress | None = None,
 ) -> dict[str, Any]:
-    """Estimate linked DS phase from a coregistered SLC stack."""
+    """Estimate linked DS phase from a coregistered SLC stack.
+
+    The local covariance matrix is built one row block at a time and
+    eigendecomposed immediately.  Peak memory is therefore ``O(n² · block ·
+    cols)`` instead of the old ``O(n² · rows · cols)`` full matrix.
+    """
     n = int(coreg.shape[0])
     if n < 6:
         raise ValueError("DS 相位链接至少需要 6 个历元")
@@ -59,12 +113,16 @@ def phase_link(
     patch = max(3, int(patch) | 1)
     k = 4.0 * np.pi / float(stack_meta["wavelength_m"])
     bperp = np.asarray(stack_meta.get("bperp_m", [0.0] * n), dtype=np.float64)
-    dem = downsample_real(np.asarray(load_stack_shape_dem(stack_meta)), m)
-    # The DEM is passed separately by the caller through stack_meta["_dem"];
-    # fall back to zeros if it is unavailable.
-    dem = np.asarray(stack_meta.get("_dem", dem), dtype=np.float32)
-    if dem.ndim == 2:
-        dem = downsample_real(dem, m)
+    if bperp.size != n:
+        raise ValueError(f"bperp_m 数量（{bperp.size}）与影像数（{n}）不一致")
+    if not np.all(np.isfinite(bperp)):
+        bperp = np.where(np.isfinite(bperp), bperp, 0.0)
+    dem_full = stack_meta.get("_dem_full")
+    if dem_full is None:
+        dem_full = stack_meta.get("_dem")
+    if dem_full is None:
+        dem_full = np.zeros((int(coreg.shape[1]), int(coreg.shape[2])), dtype=np.float32)
+    dem_full = np.asarray(dem_full, dtype=np.float32)
     sin_inc = np.sin(np.deg2rad(float(stack_meta["incidence_deg"])))
     slant = float(stack_meta.get("slant_range_m", 705000.0))
 
@@ -74,7 +132,7 @@ def phase_link(
     if progress:
         progress(0.03, "DS：去除地形相位并多视")
     for i in range(n):
-        topo = k * bperp[i] * np.asarray(stack_meta["_dem_full"], dtype=np.float32) / (slant * sin_inc)
+        topo = k * bperp[i] * dem_full / (slant * sin_inc)
         z = np.asarray(coreg[i, :rows, :cols]) * np.exp(-1j * topo[:rows, :cols])
         slc[i] = downsample_complex(z.astype(np.complex64), m)
         if progress and i % max(1, n // 6) == 0:
@@ -87,63 +145,68 @@ def phase_link(
     base = downsample_real(valid_full.astype(np.float32), m) > 0.55
     base = base[: rows // m, : cols // m] & amp_ok
 
-    coh = np.empty((n, n, rows // m, cols // m), dtype=np.complex64)
-    if progress:
-        progress(0.22, "DS：估计复数相干矩阵")
-    for i in range(n):
-        coh[i, i] = 1.0
-        for j in range(i + 1, n):
-            prod = slc[i] * np.conj(slc[j])
-            c = _filter_covariance(prod, patch)
-            c /= np.maximum(np.sqrt(diag[i] * diag[j]), 1e-9)
-            coh[i, j] = c
-            coh[j, i] = np.conj(c)
-        if progress:
-            progress(0.22 + 0.42 * (i + 1) / n, f"DS：相干矩阵 {i + 1}/{n}")
-    coh = np.clip(coh, -1, 1, out=coh)
-
     flat_base = base.ravel()
-    idx = np.flatnonzero(flat_base)
+    if not flat_base.any():
+        raise RuntimeError("DS 有效像元不足，请降低掩膜阈值")
+
     rows2, cols2 = base.shape
     linked = np.zeros((n, rows2, cols2), dtype=np.complex64)
     ds_coh = np.zeros((rows2, cols2), dtype=np.float32)
-    if idx.size == 0:
-        raise RuntimeError("DS 有效像元不足，请降低掩膜阈值")
 
-    chunk = 2048
+    block_rows = _covariance_block_rows(n, rows2, cols2)
+    eigen_chunk = _eigen_chunk_size(n)
+    half = patch // 2
     if progress:
-        progress(0.68, f"DS：特征分解 · {idx.size:,} 个像元")
-    for start in range(0, idx.size, chunk):
-        sel = idx[start : start + chunk]
-        rr, cc = np.unravel_index(sel, (rows2, cols2))
-        mats = coh[:, :, rr, cc].transpose(2, 0, 1).astype(np.complex128)
-        vals, vecs = np.linalg.eigh(mats)
-        v = vecs[:, :, -1]
-        theta = np.angle(v)
-        theta = theta - theta[:, ref_index : ref_index + 1]
-        linked[:, rr, cc] = np.exp(1j * theta).T.astype(np.complex64)
-        eig = vals[:, -1]
-        trace = vals.sum(axis=1)
-        ds_coh[rr, cc] = np.clip(eig / np.maximum(trace, 1e-9), 0, 1).astype(np.float32)
+        progress(0.22, f"DS：分块相干矩阵与特征分解 · 块高 {block_rows} 行")
+
+    for r0 in range(0, rows2, block_rows):
+        r1 = min(rows2, r0 + block_rows)
+        lo = max(0, r0 - half)
+        hi = min(rows2, r1 + half)
+        sub = slc[:, lo:hi, :]
+        sub_diag = diag[:, lo:hi, :]
+        core = slice(r0 - lo, r1 - lo)
+
+        matrix = np.empty((n, n, r1 - r0, cols2), dtype=np.complex64)
+        for i in range(n):
+            matrix[i, i] = 1.0
+            for j in range(i + 1, n):
+                prod = sub[i] * np.conj(sub[j])
+                c = _filter_covariance(prod, patch)[core]
+                c /= np.maximum(np.sqrt(sub_diag[i][core] * sub_diag[j][core]), 1e-9)
+                c.real = np.clip(c.real, -1.0, 1.0)
+                c.imag = np.clip(c.imag, -1.0, 1.0)
+                matrix[i, j] = c
+                matrix[j, i] = np.conj(c)
+
+        flat_matrix = matrix.reshape(n, n, -1)
+        selected = np.flatnonzero(base[r0:r1].ravel())
+        for start in range(0, selected.size, eigen_chunk):
+            sel = selected[start : start + eigen_chunk]
+            mats = flat_matrix[:, :, sel].transpose(2, 0, 1).astype(np.complex128)
+            vals, vecs = np.linalg.eigh(mats)
+            v = vecs[:, :, -1]
+            theta = np.angle(v)
+            theta = theta - theta[:, ref_index : ref_index + 1]
+            rr, cc = np.unravel_index(sel, (r1 - r0, cols2))
+            linked[:, r0 + rr, cc] = np.exp(1j * theta).T.astype(np.complex64)
+            eig = vals[:, -1]
+            trace = vals.sum(axis=1)
+            ds_coh[r0 + rr, cc] = np.clip(eig / np.maximum(trace, 1e-9), 0, 1).astype(np.float32)
+
         if progress:
-            progress(0.68 + 0.22 * min(1.0, (start + chunk) / idx.size), f"DS：特征分解 {min(idx.size, start + chunk):,}/{idx.size:,}")
+            progress(0.22 + 0.68 * r1 / rows2, f"DS：相干矩阵与特征分解 {r1:,}/{rows2:,} 行")
 
     return {
         "linked": linked,
-        "coherence_matrix": coh,
+        "slc": slc,
+        "diag": diag,
         "ds_coherence": ds_coh,
         "base_mask": base,
         "multilook": m,
         "patch": patch,
         "shape": (rows2, cols2),
     }
-
-
-def load_stack_shape_dem(stack_meta: dict[str, Any]) -> np.ndarray:
-    dem = stack_meta.get("_dem")
-    if dem is not None:
-        return np.asarray(dem)
-    return np.zeros((int(stack_meta.get("rows", 1)), int(stack_meta.get("cols", 1))), dtype=np.float32)
 
 
 def run_ds_interferometry(
@@ -179,7 +242,6 @@ def run_ds_interferometry(
         progress=progress,
     )
     linked = link["linked"]
-    coh_mat = link["coherence_matrix"]
     ds_coh = link["ds_coherence"]
     base = link["base_mask"]
     ds_min = float(p.get("ds_coherence_min", 0.18))
@@ -191,7 +253,6 @@ def run_ds_interferometry(
     np.save(out_dir / "ds_coherence.npy", ds_coh, allow_pickle=False)
 
     # a common reference point for all pairs
-    ref_coh = np.abs(coh_mat[0, -1]) if len(pairs) else ds_coh
     rr, cc = stable_reference(ds_coh, mask_base)
     # a high-quality point near the scene centre is more stable than a random
     # maximum; fall back to the DS coherence maximum only when needed.
@@ -208,7 +269,7 @@ def run_ds_interferometry(
             progress(0.90 + 0.06 * idx / max(len(pairs), 1), f"DS 重建干涉对 {idx + 1}/{len(pairs)}")
         sec, ref = int(pair["sec"]), int(pair["ref"])
         wrapped = np.angle(linked[sec] * np.conj(linked[ref])).astype(np.float32)
-        coh = np.abs(coh_mat[sec, ref]).astype(np.float32)
+        coh = pair_coherence(link["slc"], link["diag"], sec, ref, link["patch"])
         # linked phase is already spatially regularised; a light boxcar only
         # removes residual pixel-to-pixel noise.
         if filter_name in ("boxcar", "gaussian", "goldstein", "nlmeans", "nlm"):
@@ -237,9 +298,14 @@ def run_ds_interferometry(
         unwrapped = unwrapped.astype(np.float32)
         if p.get("remove_ramp", False):
             try:
-                from .interferometry import _remove_plane
+                from .interferometry import _remove_ramp
 
-                unwrapped, ramp_info = _remove_plane(unwrapped, coh, valid)
+                unwrapped, ramp_info = _remove_ramp(
+                    unwrapped,
+                    coh,
+                    valid,
+                    order=int(p.get("ramp_order", 1)),
+                )
             except Exception:
                 ramp_info = {"removed": False}
         else:
@@ -265,7 +331,7 @@ def run_ds_interferometry(
             "ramp": ramp_info,
             "unwrap": unwrap_info,
             "technique": "ds",
-            "ds": {"patch": int(p.get("ds_patch", 9)), "phase_linking": "eigenvalue"},
+            "ds": {"patch": int(p.get("ds_patch", 9)), "phase_linking": "emi", "covariance": "sliding_window"},
             "stats": {
                 "coherence_mean": float(np.nanmean(coh[valid])) if valid.any() else 0.0,
                 "coherence_p90": float(np.nanpercentile(coh[valid], 90)) if valid.any() else 0.0,

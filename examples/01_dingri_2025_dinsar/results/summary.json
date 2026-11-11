@@ -1,0 +1,59 @@
+{
+  "case": "01_dingri_2025_dinsar",
+  "title": "2025-01-07 Dingri Mw 7.0 earthquake - D-InSAR replay",
+  "technique": "dinsar",
+  "elapsed_s": 3.4,
+  "stack": {
+    "rows": 500,
+    "cols": 500,
+    "dates": [
+      "2025-01-05",
+      "2025-01-17"
+    ],
+    "orbit_direction": "ASCENDING",
+    "platform": "Sentinel-1A",
+    "source": "public-unwrapped-product-replay",
+    "source_doi": "10.5281/zenodo.14836721",
+    "replay_phase_scale": 10.0
+  },
+  "parameters": {
+    "remove_ramp": false,
+    "multilook": 1,
+    "filter": "none",
+    "coherence_window": 5,
+    "min_coherence": 0.0,
+    "unwrap_coherence_min": 0.0,
+    "unwrap_method": "quality",
+    "reference_mode": "manual",
+    "reference_row": 24,
+    "reference_col": 63
+  },
+  "reference_pixel": [
+    24,
+    63
+  ],
+  "statistics_mm": {
+    "min": -323.875,
+    "max": 1205.15966796875,
+    "p05": -134.74847412109375,
+    "p50": -9.592409133911133,
+    "p95": 182.5476417541504
+  },
+  "validation_against_published_product": {
+    "median_offset_mm": 0.00048542022705078125,
+    "rmse_mm": 1.1326381873226003e-05,
+    "p95_abs_residual_mm": 2.002716064453125e-05,
+    "correlation": 0.9999999999999952,
+    "valid_fraction": 0.984064,
+    "note": "Workbench output multiplied by the replay scale 10. The median offset is a constant gauge difference; the centred residual reflects smoothing and 3x downsampling."
+  },
+  "figures": [
+    "results\\figures\\dingri_los_mm.png",
+    "results\\figures\\dingri_validation.png"
+  ],
+  "outputs": [
+    "results/dingri_los_mm.npy",
+    "results/dingri_los_mm.tif",
+    "results/summary.json"
+  ]
+}

@@ -1,0 +1,105 @@
+{
+  "schema": "insar-studio/example-replay/v1",
+  "case": "02_baige_landslide_sbas",
+  "created_at": "2026-11-11",
+  "source": {
+    "url": "https://zenodo.org/api/records/10605366/files/disp_data.rar/content",
+    "doi": "10.5281/zenodo.10605366",
+    "license": "CC-BY-4.0",
+    "citation": "Displacement time series of the Baige landslide (Zenodo record 10605366)",
+    "file": "disp_data.rar",
+    "md5": "0540704e40a1924c4a726aea6482855b",
+    "size_bytes": 5617416,
+    "dt_mat_md5": "36d680f11e315b888f0fd4e17be63b9f",
+    "mask_mat_md5": "cfbee3c7f04f10244810bf4a387e094a"
+  },
+  "build": {
+    "source_shape": [
+      199,
+      51,
+      95
+    ],
+    "selected_epoch_indices": [
+      0,
+      5,
+      10,
+      15,
+      20,
+      25,
+      30,
+      35,
+      40,
+      45,
+      50,
+      55,
+      60,
+      65,
+      70,
+      75,
+      80,
+      85,
+      90,
+      95,
+      100,
+      105,
+      110,
+      115,
+      120,
+      125,
+      130,
+      135,
+      140,
+      145,
+      150,
+      155,
+      160,
+      165,
+      170,
+      175,
+      180,
+      185,
+      190,
+      195,
+      198
+    ],
+    "epoch_step": 5,
+    "time_axis": "reconstructed",
+    "time_axis_note": "Source package has no acquisition dates. A 6-day axis starting 2018-12-14 is used only for the SBAS design matrix; absolute velocities are not a new geological conclusion.",
+    "unit_assumption": "source values interpreted as millimetres",
+    "wavelength_m": 0.055465763,
+    "reference_pixel": [
+      9,
+      30
+    ]
+  },
+  "outputs": {
+    "slc.npy": {
+      "sha256": "48e0acee59083ac3aa263297507ca4c8e5a26aa5fba0d8304ac7c2da67033f50",
+      "bytes": 1589288
+    },
+    "dem.npy": {
+      "sha256": "91d4f0ff46469fadf3a8dbd4464337feb4879f95854c9a7fddc0b0068058283e",
+      "bytes": 19508
+    },
+    "mask.npy": {
+      "sha256": "f34de3b63f5e17b7d22372b3c755c515fc91284532f694ef1a640834e6a280cf",
+      "bytes": 4973
+    },
+    "truth_disp_mm.npy": {
+      "sha256": "53d9bee17a1a5dc521a34e5de5ebe666fefbe0cd928cab76602f3e60465e3726",
+      "bytes": 794708
+    }
+  },
+  "reference_stats": {
+    "shape": [
+      51,
+      95
+    ],
+    "mask_pixels": 1800,
+    "mask_fraction": 0.3715170278637771,
+    "disp_min_mm": 0.0,
+    "disp_max_mm": 75.5097427368164,
+    "disp_last_max_mm": 75.5097427368164,
+    "first_epoch_all_zero": true
+  }
+}

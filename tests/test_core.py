@@ -9,11 +9,13 @@ from __future__ import annotations
 from datetime import date, timedelta
 
 import numpy as np
+import pytest
 
 from insar_studio.core.filters import boxcar_filter, filter_complex, gaussian_filter_complex
 from insar_studio.core.network import build_network, network_closure_candidates
 from insar_studio.core.unwrapping import unwrap
 from insar_studio.core.utils import wrap_phase
+from insar_studio.params import ParamError, dinsar_pair_indices, validate_params
 
 
 def _dates(n: int) -> list[str]:
@@ -66,6 +68,27 @@ def test_dinsar_network_contains_exactly_the_requested_pair():
     assert (pairs[0]["ref"], pairs[0]["sec"]) == (3, 17)
     assert pairs[0]["id"] == "03_17"
     assert pairs[0]["dt_days"] == 14 * 12
+
+
+def test_dinsar_network_accepts_pair_id_string():
+    dates = _dates(20)
+    bperp = np.linspace(-50.0, 50.0, len(dates)).tolist()
+
+    pairs, _ = build_network(dates, bperp, "dinsar", {"dinsar_pair": "03_17"})
+
+    assert len(pairs) == 1
+    assert (pairs[0]["ref"], pairs[0]["sec"]) == (3, 17)
+    assert pairs[0]["id"] == "03_17"
+
+
+def test_dinsar_pair_validation_rejects_bad_strings_and_ranges():
+    assert dinsar_pair_indices("00_05") == (0, 5)
+    assert dinsar_pair_indices([5, 2]) == (2, 5)
+    for bad in ("5_5", "a_5", "5", "1_2_3"):
+        with pytest.raises(ParamError):
+            dinsar_pair_indices(bad)
+    with pytest.raises(ParamError):
+        validate_params({"dinsar_pair": "20_24"}, n_dates=24)
 
 
 def test_network_closure_candidate_count():

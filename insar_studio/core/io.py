@@ -91,6 +91,26 @@ def _parse_envi_header(path: Path) -> dict[str, str]:
     return out
 
 
+def probe_envi(hdr_path: Path | str) -> tuple[tuple[int, int, int], np.dtype, str, int]:
+    """Return ENVI shape/dtype/interleave/byte-order without reading pixels."""
+    hdr_path = Path(hdr_path)
+    header = _parse_envi_header(hdr_path)
+    try:
+        samples = int(header["samples"])
+        lines = int(header["lines"])
+        bands = int(header.get("bands", "1"))
+    except (KeyError, ValueError) as exc:
+        raise DataError(f"ENVI 头缺少 samples/lines/bands: {hdr_path.name}") from exc
+    dtype = _DATA_TYPES.get(int(header.get("data type", "4")))
+    if dtype is None:
+        raise DataError(f"不支持的 ENVI 数据类型: {header.get('data type')}")
+    interleave = header.get("interleave", "bsq").lower()
+    if interleave not in ("bsq", "bil", "bip"):
+        raise DataError(f"不支持的 ENVI interleave: {interleave}")
+    byte_order = int(header.get("byte order", "0"))
+    return (bands, lines, samples), np.dtype(dtype), interleave, byte_order
+
+
 def read_envi(hdr_path: Path | str) -> tuple[np.ndarray, dict[str, str]]:
     hdr_path = Path(hdr_path)
     header = _parse_envi_header(hdr_path)

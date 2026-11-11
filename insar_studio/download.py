@@ -20,6 +20,16 @@ COP_SEARCH = "https://catalogue.dataspace.copernicus.eu/odata/v1/Products"
 COP_TOKEN = "https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token"
 ASF_SEARCH = "https://api.daac.asf.alaska.edu/services/search/param"
 
+PROVIDER_ALIASES = {"copernicus": "copernicus", "cdse": "copernicus", "asf": "asf"}
+
+
+def validate_provider(provider: str) -> str:
+    """Return the canonical provider name or raise ``ValueError`` for a 400."""
+    key = str(provider or "").strip().lower()
+    if key not in PROVIDER_ALIASES:
+        raise ValueError("provider 必须是 copernicus 或 asf")
+    return PROVIDER_ALIASES[key]
+
 
 def _session() -> requests.Session:
     s = requests.Session()
@@ -148,8 +158,8 @@ def search(
     username: str = "",
     password: str = "",
 ) -> list[dict[str, Any]]:
-    provider = provider.lower()
-    if provider in ("copernicus", "cdse"):
+    provider = validate_provider(provider)
+    if provider == "copernicus":
         return search_copernicus(
             bbox=bbox,
             start=start,
@@ -175,11 +185,12 @@ def download(
     timeout: int = 120,
 ) -> Path:
     """Stream a product to disk, reporting bytes and relative progress."""
+    provider = validate_provider(provider)
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
     token = ""
     auth = None
-    if provider in ("copernicus", "cdse"):
+    if provider == "copernicus":
         if username and password:
             token = copernicus_token(username, password)
     elif provider == "asf":

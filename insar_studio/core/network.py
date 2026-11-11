@@ -8,6 +8,7 @@ from typing import Any
 import numpy as np
 
 from ..config import DEFAULT_PROCESSING
+from ..params import dinsar_pair_indices
 from .plotting import save_network
 from .utils import atomic_write_json, parse_date
 
@@ -65,8 +66,8 @@ def build_network(
     pairs: list[dict[str, Any]] = []
 
     if technique == "dinsar":
-        chosen = p.get("dinsar_pair")
-        if chosen and len(chosen) == 2:
+        chosen = dinsar_pair_indices(p.get("dinsar_pair"), n_dates=n)
+        if chosen:
             pairs.append(_pair(chosen[0], chosen[1], dates, bperp))
         else:
             i = max(0, n // 3)

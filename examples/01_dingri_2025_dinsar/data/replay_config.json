@@ -1,0 +1,58 @@
+{
+  "schema": "insar-studio/example-replay/v1",
+  "case": "01_dingri_2025_dinsar",
+  "created_at": "2026-11-11",
+  "source": {
+    "url": "https://zenodo.org/api/records/14836721/files/ASC_20250105_20250117.adf_quad.unw.geo.tif/content",
+    "doi": "10.5281/zenodo.14836721",
+    "license": "CC-BY-4.0",
+    "citation": "Geodetic Observations and Seismogenic Structures of the 2025 Mw 7.0 Dingri Earthquake: The Largest Normal Faulting Event in the Southern Tibet Rift (Zenodo record 14836721)",
+    "file": "ASC_20250105_20250117.adf_quad.unw.geo.tif",
+    "md5": "894d51cb912ff24ece4af8931d8ee57c",
+    "size_bytes": 27545235
+  },
+  "build": {
+    "crop_row": 569,
+    "crop_col": 1288,
+    "crop_size": 1500,
+    "no_data_fill": "nearest-neighbour (scipy.ndimage.distance_transform_edt)",
+    "gaussian_sigma": 10.0,
+    "downsample_factor": 3,
+    "phase_scale": 0.1,
+    "phase_scale_note": "workbench displacement × 10 = published LOS",
+    "wavelength_m": 0.055465763,
+    "reference_pixel": [
+      24,
+      63
+    ]
+  },
+  "outputs": {
+    "slc.npy": {
+      "sha256": "fae16f6649464d2ab472495b946f1e253842a07309045f081101a2b5cc68c63d",
+      "bytes": 4000128
+    },
+    "dem.npy": {
+      "sha256": "403734f34d35d7ef05b799179206eb08d9b06c009e8f239a38e978a437a6f734",
+      "bytes": 1000128
+    },
+    "mask.npy": {
+      "sha256": "68c7811118a88f53df85c970037f315509ce789630aecfbe82dcd1bb184ebd11",
+      "bytes": 250128
+    },
+    "reference_los_mm.npy": {
+      "sha256": "33fa045448144196f5be65fcdec4869071849a03eea98cfdcea53ff506dcd513",
+      "bytes": 1000128
+    }
+  },
+  "reference_stats": {
+    "valid_fraction": 0.9943373333333333,
+    "los_min_mm": -323.8755187988281,
+    "los_max_mm": 1205.1591796875,
+    "los_p05_mm": -133.65000228881837,
+    "los_p95_mm": 180.18621368408202,
+    "shape": [
+      500,
+      500
+    ]
+  }
+}

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 from pathlib import Path
@@ -89,6 +90,28 @@ def test_import_into_missing_project_returns_404(tmp_path, monkeypatch):
 
     assert response.status_code == 404
     assert response.get_json()["error"] == "项目不存在"
+
+
+def test_route_switch_and_run_reject_short_stack(tmp_path, monkeypatch):
+    client, store = _client(tmp_path, monkeypatch)
+    project = store.create("短栈", "dinsar", source="empty")
+    stack = store.path(project["id"]) / "data" / "stack"
+    stack.mkdir(parents=True)
+    (stack / "meta.json").write_text(json.dumps({"n_dates": 5}), encoding="utf-8")
+
+    switched = client.patch(
+        f"/api/projects/{project['id']}",
+        json={"technique": "ps"},
+    )
+    assert switched.status_code == 400
+    assert "8 景" in switched.get_json()["error"]
+
+    run = client.post(
+        f"/api/projects/{project['id']}/run",
+        json={"technique": "sbas", "params": {}},
+    )
+    assert run.status_code == 400
+    assert "8 景" in run.get_json()["error"]
 
 
 def test_series_before_processing_returns_404(tmp_path, monkeypatch):

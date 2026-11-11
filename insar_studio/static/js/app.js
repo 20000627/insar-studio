@@ -72,8 +72,15 @@
     jobTimer: null,
     dlResults: [],
     searchBusy: false,
-    newProject: null
+    newProject: null,
+    projectTotal: 0,
+    projectHasMore: false,
+    projectOffset: 0,
+    projectQuery: '',
+    projectTimer: null
   };
+
+  const PROJECT_PAGE_SIZE = 60;
 
   /* --------------------------------------------------------------- utils */
   function esc(value) {
@@ -131,7 +138,7 @@
 
   function techDefaults(key) {
     if (key === 'ps') return { multilook: 1, max_temporal_baseline: 96, max_pairs: 140, ps_star_all: true };
-    if (key === 'ds') return { multilook: 2, max_temporal_baseline: 72, ds_patch: 9, ds_overlap: 0.5 };
+    if (key === 'ds') return { multilook: 2, max_temporal_baseline: 72, ds_patch: 9 };
     if (key === 'dinsar') return { multilook: 2 };
     return { multilook: 2 };
   }
@@ -180,6 +187,26 @@
       opts.headers['Content-Type'] = 'application/json';
     }
     const response = await fetch(path, opts);
+    const type = response.headers.get('content-type') || '';
+    let data = null;
+    if (type.includes('application/json')) {
+      data = await response.json();
+    } else {
+      const text = await response.text();
+      data = text ? { message: text } : {};
+    }
+    if (!response.ok) {
+      const msg = (data && (data.error || data.message)) || `${response.status} ${response.statusText}`;
+      const error = new Error(msg);
+      error.status = response.status;
+      error.payload = data;
+      throw error;
+    }
+    return data;
+  }
+
+  async function apiUpload(path, formData) {
+    const response = await fetch(path, { method: 'POST', body: formData });
     const type = response.headers.get('content-type') || '';
     let data = null;
     if (type.includes('application/json')) {
@@ -251,8 +278,20 @@
     }
     await loadProjects();
     const last = localStorage.getItem('insar.lastProject');
-    if (last && state.projects.some(p => p.id === last)) {
-      await openProject(last);
+    if (last) {
+      if (!state.projects.some(p => p.id === last)) {
+        try {
+          const found = await api(`/api/projects?q=${encodeURIComponent(last)}&limit=1`);
+          const row = (found.projects || []).find(p => p.id === last);
+          if (row) state.projects.unshift(row);
+        } catch (err) { /* stale last-project pointer */ }
+      }
+      if (state.projects.some(p => p.id === last)) {
+        await openProject(last);
+      } else {
+        localStorage.removeItem('insar.lastProject');
+        renderNoProject();
+      }
     } else {
       renderNoProject();
     }
@@ -268,7 +307,10 @@
       if (log) log.innerHTML = '<div class="console-empty"><span class="console-glyph">⌁</span><p>日志区已清空，任务记录仍保存在工作区。</p></div>';
       $('#btn-clear-log').disabled = true;
     });
-    $('#project-search').addEventListener('input', renderSidebar);
+    $('#project-search').addEventListener('input', () => {
+      if (state.projectTimer) clearTimeout(state.projectTimer);
+      state.projectTimer = setTimeout(() => loadProjects(), 250);
+    });
     const consolePanel = $('#console');
     if (consolePanel) {
       const head = $('.console-head', consolePanel);
@@ -319,10 +361,33 @@
   }
 
   /* --------------------------------------------------------------- projects */
-  async function loadProjects() {
+  async function loadProjects({ reset = true, refresh = false } = {}) {
+    const query = ($('#project-search') && $('#project-search').value || '').trim();
+    const offset = reset ? 0 : state.projectOffset;
     try {
-      const data = await api('/api/projects');
-      state.projects = data.projects || [];
+      const url = `/api/projects?offset=${offset}&limit=${PROJECT_PAGE_SIZE}&q=${encodeURIComponent(query)}${refresh ? '&refresh=1' : ''}`;
+      const data = await api(url);
+      const rows = data.projects || [];
+      if (reset) {
+        state.projects = rows;
+        state.projectOffset = 0;
+        // The open project may live beyond the first page.  Keep its row in
+        // the rail so refreshes and job completions never hide the active item.
+        if (state.projectId && !query && !rows.some(p => p.id === state.projectId)) {
+          try {
+            const found = await api(`/api/projects?q=${encodeURIComponent(state.projectId)}&limit=1${refresh ? '&refresh=1' : ''}`);
+            const row = (found.projects || []).find(p => p.id === state.projectId);
+            if (row) state.projects.unshift(row);
+          } catch (err) { /* keep the current page */ }
+        }
+      } else {
+        const merged = state.projects.concat(rows);
+        state.projects = Array.from(new Map(merged.map(p => [p.id, p])).values());
+      }
+      state.projectOffset += rows.length;
+      state.projectTotal = Number(data.total) || state.projects.length;
+      state.projectHasMore = Boolean(data.has_more);
+      state.projectQuery = query;
       renderSidebar();
     } catch (err) {
       toast(`项目列表读取失败：${err.message}`, 'error');
@@ -332,12 +397,17 @@
   function renderSidebar() {
     const host = $('#project-list');
     if (!host) return;
-    const query = ($('#project-search') && $('#project-search').value || '').trim().toLowerCase();
-    const rows = state.projects.filter(p => !query || `${p.name} ${p.id}`.toLowerCase().includes(query));
+    const rows = state.projects;
     if (!rows.length) {
-      host.innerHTML = `<div class="rail-empty">${state.projects.length ? '没有匹配的项目。' : '还没有项目。<br>点击「新建」创建演示项目或导入数据。'}</div>`;
+      const hint = state.projectQuery
+        ? '没有匹配的项目。'
+        : (state.projectTotal ? '没有更多项目。' : '还没有项目。<br>点击「新建」创建演示项目或导入数据。');
+      host.innerHTML = `<div class="rail-empty">${hint}</div>`;
       return;
     }
+    const more = state.projectHasMore
+      ? `<button class="rail-more" id="btn-more-projects">加载更多（${state.projects.length} / ${state.projectTotal}）</button>`
+      : '';
     host.innerHTML = rows.map(p => {
       const tech = techMeta(p.technique);
       const active = p.id === state.projectId ? ' active' : '';
@@ -363,10 +433,12 @@
         <div class="pi-dates">${esc(dates || p.id)}${staleText}</div>
         <div class="progress-inline"><i style="width:${pct}%"></i></div>
       </button>`;
-    }).join('');
+    }).join('') + more;
     $$('.project-item', host).forEach(btn => {
       btn.addEventListener('click', () => openProject(btn.dataset.project));
     });
+    const moreBtn = $('#btn-more-projects');
+    if (moreBtn) moreBtn.addEventListener('click', () => loadProjects({ reset: false }));
   }
 
   function renderNoProject() {
@@ -390,6 +462,7 @@
       content.innerHTML = welcomeHtml();
       $('#welcome-new').addEventListener('click', openNewProject);
       $('#welcome-demo').addEventListener('click', runQuickDemo);
+      $('#welcome-help').addEventListener('click', () => $('#btn-help').click());
     }
   }
 
@@ -402,7 +475,7 @@
         <div class="welcome-actions">
           <button class="btn btn-primary" id="welcome-new">＋ 新建项目</button>
           <button class="btn btn-amber" id="welcome-demo">用演示数据跑一遍</button>
-          <button class="btn btn-ghost" onclick="document.getElementById('btn-help').click()">查看使用说明</button>
+          <button class="btn btn-ghost" id="welcome-help">查看使用说明</button>
         </div>
         <div class="welcome-features">
           <div class="welcome-feature"><b>四条技术路线</b><span>D-InSAR · PS · SBAS · DS</span></div>
@@ -433,7 +506,7 @@
       state.series = null;
       state.seriesPoint = null;
       state.selectedPair = ov.pairs && ov.pairs.length ? ov.pairs[0].id : null;
-      state.atmSource = (ov.atmosphere && ov.atmosphere.source) || (ov.project.demo ? 'demo' : 'local');
+      state.atmSource = (ov.atmosphere && ov.atmosphere.source) || (ov.project.demo ? 'demo' : 'official');
       state.step = firstPendingStep(ov);
       renderSidebar();
       renderAll();
@@ -465,7 +538,7 @@
     if (!state.selectedTech) state.selectedTech = ov.project.technique;
     if (!state.selectedPair && ov.pairs && ov.pairs.length) state.selectedPair = ov.pairs[0].id;
     if (!keepStep) state.step = firstPendingStep(ov);
-    await loadProjects();
+    await loadProjects({ refresh: true });
   }
 
   function renderAll() {
@@ -700,6 +773,8 @@
       if (key === currentTech()) return;
       const hasProducts = (state.overview.status || []).some(s => s.done && !['project', 'data'].includes(s.key));
       if (hasProducts && !confirm(`切换到 ${techMeta(key).name} 会清空现有网络、干涉、大气与反演产品（保留原始数据与配准结果）。继续？`)) return;
+      const previousTech = currentTech();
+      const previousParams = state.project && state.project.params ? { ...state.project.params } : null;
       state.selectedTech = key;
       applyTechDefaults(key);
       try {
@@ -710,7 +785,12 @@
         state.step = hasProducts ? 'network' : 'project';
         renderAll();
         toast(hasProducts ? `已切换到 ${techMeta(key).name}，旧产品已清理，请重建网络。` : `已切换到 ${techMeta(key).name}。`);
-      } catch (err) { toast(err.message, 'error'); }
+      } catch (err) {
+        state.selectedTech = previousTech;
+        if (state.project && previousParams) state.project.params = previousParams;
+        renderAll();
+        toast(err.message, 'error');
+      }
     }));
     const resetBtn = $('#btn-reset-project');
     if (resetBtn) resetBtn.addEventListener('click', resetProjectProducts);
@@ -769,7 +849,8 @@
           <div class="card-head"><div><h3>导入本地数据</h3><div class="hint">支持原生 .npy 栈、ENVI 栈、复数 GeoTIFF 目录与 Sentinel-1 SAFE（实验）。</div></div></div>
           <div class="field"><label>数据目录或文件路径</label><input type="text" id="import-path" placeholder="D:\\data\\sentinel1\\stack"></div>
           <div class="field" style="margin-top:9px"><label>DEM 路径 <span class="unit">可选</span></label><input type="text" id="import-dem" placeholder="D:\\data\\dem.tif"></div>
-          <div class="btn-row" style="margin-top:11px"><button class="btn btn-primary" id="btn-import">导入到当前项目</button><span class="small muted">导入会覆盖当前影像栈。</span></div>
+          <label class="checkline" style="margin-top:9px"><input type="checkbox" id="import-coregistered"><span>导入的 SLC 已经配准<span class="help">勾选后直接使用现有配准栈，不再执行二次配准；只适用于已在 SNAP / ISCE 等工具中完成配准的数据。</span></span></label>
+          <div class="btn-row" style="margin-top:11px"><button class="btn btn-primary" id="btn-import">预检并导入</button><span class="small muted">导入会覆盖当前影像栈。</span></div>
           <div class="inline-note" style="margin-top:10px">目录中放 <span class="mono">slc.npy</span>（形状：时相 × 行 × 列）与可选的 <span class="mono">dem.npy</span>、<span class="mono">mask.npy</span>、<span class="mono">meta.json</span> 即可。</div>
         </div>
         <div class="card">
@@ -804,23 +885,53 @@
     $('#btn-import').addEventListener('click', async () => {
       const path = $('#import-path').value.trim();
       if (!path) { toast('请填写数据路径', 'error'); return; }
-      if (!confirm('导入会覆盖当前影像栈，并清空网络、干涉、大气与反演成果。继续？')) return;
+      const demPath = $('#import-dem').value.trim();
+      const coregistered = !!($('#import-coregistered') && $('#import-coregistered').checked);
+      const meta = coregistered ? { already_coregistered: true } : {};
       const btn = $('#btn-import');
       btn.disabled = true;
-      btn.textContent = '导入中…';
+      btn.textContent = '预检中…';
       try {
+        const pre = await api(`/api/projects/${encodeURIComponent(state.projectId)}/import/preflight`, {
+          method: 'POST', body: { path, dem_path: demPath, meta }
+        });
+        const pf = pre.preflight || {};
+        const warnings = pf.warnings || [];
+        const validationNote = (() => {
+          if (pf.validation === 'sampled') {
+            const pct = (Number(pf.sample_fraction || 0) * 100).toFixed(1);
+            return `已抽样校验 ${pf.sample_elements || 0} / ${pf.total_elements || 0} 个元素（${pct}%），正式导入会完整校验。`;
+          }
+          if (pf.validation === 'header') {
+            return '已校验文件头与结构，正式导入会读取并完整校验数据。';
+          }
+          return '已完成完整数据校验。';
+        })();
+        const summary = [
+          `预检通过：${pf.n_dates} 景 · ${pf.rows} × ${pf.cols} px`,
+          validationNote,
+          pf.already_coregistered ? '已标记为已配准，将跳过二次配准。' : '导入后会按当前参数执行配准。',
+          pf.geo_referenced ? '已读取地理参考。' : '没有地理参考，成果将使用像元坐标。',
+          ...warnings.map(w => `· ${w}`)
+        ];
+        if (!confirm(`${summary.join('\n')}\n\n导入会覆盖当前影像栈，并清空网络、干涉、大气与反演成果。继续？`)) {
+          return;
+        }
+        btn.textContent = '导入中…';
         const res = await api(`/api/projects/${encodeURIComponent(state.projectId)}/import`, {
-          method: 'POST', body: { path, dem_path: $('#import-dem').value.trim() }
+          method: 'POST', body: { path, dem_path: demPath, meta }
         });
         state.results = null;
         await refreshOverview({ keepStep: true });
         renderAll();
-        toast(`导入完成：${res.stack.n_dates} 景，${res.stack.rows} × ${res.stack.cols} px`, 'success');
+        const warns = res.stack.import_warnings || [];
+        toast(`导入完成：${res.stack.n_dates} 景，${res.stack.rows} × ${res.stack.cols} px${warns.length ? ` · ${warns.length} 条提示` : ''}`, warns.length ? 'info' : 'success');
+        if (warns.length) toast(`导入提示：${warns[0]}`, 'info');
       } catch (err) {
         toast(err.message, 'error');
       } finally {
         btn.disabled = false;
-        btn.textContent = '导入到当前项目';
+        btn.textContent = '预检并导入';
       }
     });
     $('#btn-dl-search').addEventListener('click', searchDownloads);
@@ -925,6 +1036,7 @@
             <div class="form-grid expert-only" style="margin-top:8px">
               <div class="field"><label>参考影像序号 <span class="unit">0 起</span></label><input type="number" data-param="ref_index" min="0" max="${Math.max(0, dates.length - 1)}" value="${esc(refIdx)}"></div>
               <div class="field"><label>最大对数</label><input type="number" data-param="max_pairs" min="10" max="600" value="${esc(pval('max_pairs', 80))}"></div>
+              ${coregModelField()}
             </div>
             ${tech === 'ps' ? `<label class="checkline expert-only"><input type="checkbox" data-param="ps_star_all" ${pval('ps_star_all', true) ? 'checked' : ''}><span>PS 使用全星形网络（所有影像连到参考影像）<span class="help">关闭后只保留短时间基线星形对；相邻对仍会自动补充用于闭合检查。</span></span></label>` : ''}
             <div class="inline-note" style="margin-top:10px">${tech === 'ps' ? 'PS 默认 45 对星形 + 相邻网络，多视 1，保留点目标。' : (tech === 'ds' ? 'DS 默认 72 天 / 180 m 基线，相位链接在干涉步骤执行。' : 'SBAS 默认 72 天 / 180 m 基线，得到约 80 对；冗余度 3 以上较稳健。')}</div>
@@ -948,6 +1060,16 @@
       </div>`;
   }
 
+  function coregModelField() {
+    const current = String(pval('model', 'affine') || 'affine');
+    const options = [
+      ['affine', '仿射（推荐）'],
+      ['similarity', '相似（旋转+尺度）'],
+      ['translation', '平移（仅偏移）'],
+    ];
+    return `<div class="field"><label>配准模型</label><select data-param="model">${options.map(([value, label]) => `<option value="${value}" ${current === value ? 'selected' : ''}>${label}</option>`).join('')}</select></div>`;
+  }
+
   function dinsarPairFields(pairs) {
     const dates = (state.overview.stack && state.overview.stack.dates) || state.overview.dates || [];
     const existing = pairs[0] || null;
@@ -959,7 +1081,8 @@
       <div class="form-grid" style="margin-top:10px">
         <div class="field"><label>主影像</label><select data-dinsar-ref>${dates.map((d, i) => `<option value="${i}" ${i === ref ? 'selected' : ''}>${i + 1}. ${esc(d)}</option>`).join('')}</select></div>
         <div class="field"><label>从影像</label><select data-dinsar-sec>${dates.map((d, i) => `<option value="${i}" ${i === sec ? 'selected' : ''}>${i + 1}. ${esc(d)}</option>`).join('')}</select></div>
-      </div>`;
+      </div>
+      <div class="form-grid expert-only" style="margin-top:8px">${coregModelField()}</div>`;
   }
 
   function networkSvg(ov) {
@@ -1059,7 +1182,7 @@
             ${Object.keys(FIELD_LABELS).map(k => `<button class="field-tab ${field === k ? 'active' : ''}" data-field="${k}">${FIELD_LABELS[k]}</button>`).join('')}
           </div>
           <div class="viewer">
-            ${pair && ifg.n_pairs ? `<img src="${img}" alt="${FIELD_LABELS[field]}" onerror="this.style.display='none';this.nextElementSibling.style.display='block'"><div class="viewer-empty" style="display:none">该场尚未生成。请先运行干涉处理，或换一个显示场。</div>` : '<div class="viewer-empty">尚未生成干涉图。设置参数后点击右侧「运行干涉处理」。</div>'}
+            ${pair && ifg.n_pairs ? `<img id="pair-image" src="${img}" alt="${FIELD_LABELS[field]}"><div class="viewer-empty" id="pair-image-empty" style="display:none">该场尚未生成。请先运行干涉处理，或换一个显示场。</div>` : '<div class="viewer-empty">尚未生成干涉图。设置参数后点击右侧「运行干涉处理」。</div>'}
             ${pair ? `<div class="viewer-cap"><span>${esc(pair.id)} · ${esc(pair.ref_date)} → ${esc(pair.sec_date)} · Δt ${fmt(pair.dt_days, 0)} 天 · B⊥ ${fmtSigned(pair.bperp_diff, 1, ' m')}</span><span>${FIELD_LABELS[field]}</span></div>` : ''}
           </div>
           <div class="inline-note" style="margin-top:10px">${tech === 'ps' ? 'PS 路线使用单视（multilook = 1）保留点目标；强滤波会削弱永久散射体，建议只用轻量 boxcar。' : (tech === 'ds' ? 'DS 路线会先做相位链接，再重建干涉对相位；本页可预览普通干涉结果，最终 DS 产品在反演步骤生成。' : '相位图出现大面积条纹跳变或噪声，优先提高相干性阈值或减小多视；不要用滤波掩盖解缠错误。')}</div>
@@ -1072,8 +1195,9 @@
             <div class="field"><label>解缠算法</label><select data-param="unwrap_method">${[['quality', '质量引导（内置）'], ['snaphu', 'SNAPHU（需安装）'], ['skimage', '最小二乘（skimage）']].map(([v, l]) => `<option value="${v}" ${pval('unwrap_method', 'quality') === v ? 'selected' : ''}>${l}</option>`).join('')}</select></div>
             <div class="field"><label>相干性阈值</label><input type="number" data-param="unwrap_coherence_min" min="0" max="0.9" step="0.01" value="${esc(pval('unwrap_coherence_min', 0.18))}"></div>
           </div>
-          <label class="checkline expert-only"><input type="checkbox" data-param="remove_ramp" ${pval('remove_ramp', true) ? 'checked' : ''}><span>解缠后去除线性/二次趋势面<span class="help">会同时移除真实的长波形变，仅在确认存在轨道或长波误差时使用。</span></span></label>
+          <label class="checkline expert-only"><input type="checkbox" data-param="remove_ramp" ${pval('remove_ramp', true) ? 'checked' : ''}><span>解缠后去除趋势面<span class="help">会同时移除真实的长波形变，仅在确认存在轨道或长波误差时使用。</span></span></label>
           <div class="form-grid expert-only" style="margin-top:6px">
+            <div class="field"><label>趋势面阶数</label><select data-param="ramp_order">${[[1, '平面（一次）'], [2, '二次曲面']].map(([v, l]) => `<option value="${v}" ${Number(pval('ramp_order', 1)) === v ? 'selected' : ''}>${l}</option>`).join('')}</select></div>
             <div class="field"><label>相干性窗口 <span class="unit">px</span></label><input type="number" data-param="coherence_window" min="3" max="15" value="${esc(pval('coherence_window', 5))}"></div>
             <div class="field"><label>有效相干性下限</label><input type="number" data-param="min_coherence" min="0" max="0.9" step="0.01" value="${esc(pval('min_coherence', 0.25))}"></div>
             <div class="field"><label>Boxcar 窗口 <span class="unit">px</span></label><input type="number" data-param="boxcar_size" min="1" max="15" value="${esc(pval('boxcar_size', 3))}"></div>
@@ -1093,6 +1217,12 @@
       state.selectedPair = sel.value;
       renderStepContent();
     });
+    const image = $('#pair-image');
+    if (image) image.addEventListener('error', () => {
+      image.style.display = 'none';
+      const empty = $('#pair-image-empty');
+      if (empty) empty.style.display = 'block';
+    });
     $$('[data-field]').forEach(btn => btn.addEventListener('click', () => {
       state.pairField = btn.dataset.field;
       renderStepContent();
@@ -1106,21 +1236,29 @@
     const ov = state.overview;
     const atm = ov.atmosphere || {};
     const method = pval('atmosphere_method', atm.method || (ov.project.demo ? 'gacos' : 'empirical'));
-    const source = pval('gacos_source', state.atmSource || atm.source || (ov.project.demo ? 'demo' : 'local'));
+    const rawSource = pval('gacos_source', state.atmSource || atm.source || (ov.project.demo ? 'demo' : 'official'));
+    const source = ov.project.demo ? rawSource : (rawSource === 'demo' ? 'official' : rawSource);
     const val = atm.validation || {};
     const hasAtm = !!atm.method;
     const methodLabel = { gacos: 'GACOS 逐日延迟', empirical: '经验高程校正', off: '不校正' }[method] || method;
+    const sourceLabels = { demo: '模拟 GACOS', official: '官方 GACOS', local: '本地产品', online: '自定义在线' };
+    const sourceOptions = [
+      ...(ov.project.demo ? [['demo', '演示 · 合成逐日延迟']] : []),
+      ['official', '官方 · 申请 / 邮件导入（推荐）'],
+      ['local', '本地 · .ztd / .tif / .npy'],
+      ['online', '在线 · 自定义服务'],
+    ];
     return `
       ${guide('☁', '大气是毫米级形变最大的“假信号”', '对流层延迟在空间上平滑、在时间上变化，和形变混在一起。GACOS 用外部天气模型逐日估计延迟；经验法则用相位—高程关系扣除分层大气。没有外部数据时，反演中的时间高通也能压掉一部分。', 'STEP 5 / 7')}
       <div class="grid-4">
-        ${statCard('当前方法', methodLabel, atm.source ? `数据源 ${atm.source}` : '尚未校正', 'accent')}
+        ${statCard('当前方法', methodLabel, atm.source ? `数据源 ${sourceLabels[atm.source] || atm.source}` : '尚未校正', 'accent')}
         ${statCard('校正干涉对', `${atm.n_pairs || 0}<small> 对</small>`, hasAtm ? '已写入 unwrapped_atmcorr' : '')}
         ${statCard('相位离散度降低', atm.phase_std_reduction_pct !== undefined ? `${fmt(atm.phase_std_reduction_pct, 1)}<small> %</small>` : '—', '校正前后稳健标准差', 'good')}
         ${statCard('成对残差', val.pair_residual_after_mm !== undefined ? `${fmt(val.pair_residual_after_mm, 2)}<small> mm</small>` : '—', val.pair_residual_before_mm !== undefined ? `校正前 ${fmt(val.pair_residual_before_mm, 2)} mm` : '无真值时不显示')}
       </div>
       <div class="grid-2" style="margin-top:14px">
         <div class="card">
-          <div class="card-head"><div><h3>校正方法</h3><div class="hint">演示项目可用“模拟 GACOS”，它与合成大气完全一致，便于观察上限。</div></div></div>
+          <div class="card-head"><div><h3>校正方法</h3><div class="hint">真实数据推荐官方 GACOS：先在官网申请，收到邮件后把下载链接或 tar.gz 导入项目。</div></div></div>
           <div class="tech-grid" style="grid-template-columns:repeat(3,minmax(0,1fr))">
             ${[['gacos', 'GACOS', '外部逐日天顶延迟，转 LOS 后逐对差分'], ['empirical', '经验高程', '相位—高程稳健回归，无需外部数据'], ['off', '不校正', '保留原始相位，反演中做时间高通']].map(([k, n, d]) => `
               <button class="tech-card ${method === k ? 'selected' : ''}" data-atm-method="${k}">
@@ -1130,18 +1268,18 @@
           ${method === 'gacos' ? `
             <div class="form-grid" style="margin-top:12px">
               <div class="field"><label>GACOS 数据源</label><select data-param="gacos_source" id="gacos-source">
-                <option value="demo" ${source === 'demo' ? 'selected' : ''}>演示 · 合成逐日延迟</option>
-                <option value="local" ${source === 'local' ? 'selected' : ''}>本地 · .ztd / .tif / .npy</option>
-                <option value="online" ${source === 'online' ? 'selected' : ''}>在线 · 自定义服务</option>
+                ${sourceOptions.map(([value, label]) => `<option value="${value}" ${source === value ? 'selected' : ''}>${label}</option>`).join('')}
               </select></div>
               <div class="field"><label>多视因子 <span class="unit">与干涉一致</span></label><input type="number" data-param="multilook" min="1" max="8" value="${esc(pval('multilook', 2))}"></div>
             </div>
+            ${source === 'official' ? gacosOfficialPanel(ov.gacos || {}) : ''}
             ${source === 'local' ? `<div class="field" style="margin-top:9px"><label>GACOS 目录</label><input type="text" data-param="gacos_dir" value="${esc(pval('gacos_dir', ''))}" placeholder="D:\\gacos\\2023"><span class="help">目录内文件名需包含日期（YYYYMMDD 或 YYYY-MM-DD），支持 .ztd/.rsc、.tif、.npy。</span></div>` : ''}
             ${source === 'online' ? `<div class="form-grid expert-only" style="margin-top:9px">
               <div class="field"><label>服务地址</label><input type="text" data-param="gacos_url" value="${esc(pval('gacos_url', ''))}" placeholder="https://…"></div>
               <div class="field"><label>邮箱 / 令牌</label><input type="text" data-param="gacos_email" value="" placeholder="仅本次任务使用"></div>
-            </div><div class="field expert-only" style="margin-top:8px"><label>访问令牌</label><input type="password" data-param="gacos_token" value="" placeholder="不会写入项目"></div>` : ''}
-            ${source === 'demo' && !ov.project.demo ? '<div class="inline-note" style="margin-top:9px">当前项目不是演示数据，没有内置模拟大气；请改用本地或在线 GACOS，或选择经验高程校正。</div>' : ''}
+            </div><div class="field expert-only" style="margin-top:8px"><label>访问令牌</label><input type="password" data-param="gacos_token" value="" placeholder="不会写入项目"></div>
+            <div class="inline-note" style="margin-top:9px">自定义在线服务不是 GACOS 官方接口；官方服务只支持网页申请与邮件交付，请使用“官方”数据源。</div>` : ''}
+            ${source === 'demo' && !ov.project.demo ? '<div class="inline-note" style="margin-top:9px">当前项目不是演示数据，没有内置模拟大气；请改用官方或本地 GACOS，或选择经验高程校正。</div>' : ''}
           ` : ''}
           <div class="btn-row" style="margin-top:13px">${actionButton('btn-run-atm', hasAtm ? '重新校正大气' : '运行大气校正')}</div>
           <div class="small muted" style="margin-top:7px">校正结果写入每个干涉对的 unwrapped_atmcorr.npy，反演会自动优先读取。</div>
@@ -1151,14 +1289,67 @@
           ${ov.assets && ov.assets.atmosphere ? `<div class="thumb-card"><img src="${assetUrl(ov.assets.atmosphere)}" alt="大气诊断"></div>` : '<div class="empty-mini">运行大气校正后生成诊断图。</div>'}
           <div style="margin-top:10px">
             <div class="kv-row"><span class="k">方法</span><span class="v">${esc(atm.method || '—')}</span></div>
-            <div class="kv-row"><span class="k">数据源</span><span class="v">${esc(atm.source || '—')}</span></div>
+            <div class="kv-row"><span class="k">数据源</span><span class="v">${esc(sourceLabels[atm.source] || atm.source || '—')}</span></div>
             <div class="kv-row"><span class="k">逐日屏数量</span><span class="v">${esc(atm.n_screens || '—')}</span></div>
             <div class="kv-row"><span class="k">平均 |延迟|</span><span class="v">${atm.mean_abs_screen_mm !== undefined ? `${fmt(atm.mean_abs_screen_mm, 2)} mm` : '—'}</span></div>
             ${val.pair_residual_before_mm !== undefined ? `<div class="kv-row"><span class="k">真值成对残差（前 → 后）</span><span class="v">${fmt(val.pair_residual_before_mm, 2)} → ${fmt(val.pair_residual_after_mm, 2)} mm</span></div>` : ''}
             ${val.pair_residual_noise_floor_mm !== undefined ? `<div class="kv-row"><span class="k">噪声底</span><span class="v">${fmt(val.pair_residual_noise_floor_mm, 2)} mm</span></div>` : ''}
           </div>
+          ${(atm.warnings && atm.warnings.length) ? atm.warnings.map(w => `<div class="inline-note danger" style="margin-top:8px">${esc(w)}</div>`).join('') : ''}
           <div class="inline-note" style="margin-top:10px">校正过度会吃掉真实长波形变；若速率图出现大面积负相关纹理，回退到“不校正”或只保留时间高通。</div>
         </div>
+      </div>`;
+  }
+
+  function gacosOfficialPanel(g) {
+    const o = g.official || {};
+    const d = g.defaults || {};
+    const limits = g.limits || (state.cap && state.cap.gacos && state.cap.gacos.limits) || {};
+    const missing = o.missing_dates || [];
+    const warnings = o.warnings || [];
+    const lastReq = o.last_request || null;
+    const lastImp = o.last_import || null;
+    const nDates = o.n_dates || d.n_dates || 0;
+    const nAvail = o.n_available || 0;
+    const coverage = nDates ? Math.round(100 * nAvail / nDates) : 0;
+    const bbox = d.bbox;
+    const bboxText = bbox
+      ? `W ${fmt(bbox[0], 4)} · S ${fmt(bbox[1], 4)} · E ${fmt(bbox[2], 4)} · N ${fmt(bbox[3], 4)}`
+      : '无法自动确定，请在申请时手动填写';
+    const hour = String(d.hour ?? 0).padStart(2, '0');
+    const minute = String(d.minute ?? 0).padStart(2, '0');
+    const timeText = `${hour}:${minute} UTC${d.time_source === 'start_times' ? '（来自成像时刻）' : '（默认）'}`;
+    const failed = lastReq && Array.isArray(lastReq.batches) ? lastReq.batches.filter(b => !b.ok) : [];
+    const formUrl = (state.cap && state.cap.gacos && state.cap.gacos.form_url) || g.form_url || 'http://www.gacos.net/';
+    return `
+      <div class="card" style="margin-top:12px">
+        <div class="card-head">
+          <div><h3>官方 GACOS 产品</h3><div class="hint">官网异步申请 → 邮件下载 → 导入项目。邮箱只用于本次提交，不写入项目。</div></div>
+          <span class="badge ${nDates && nAvail >= nDates ? 'green' : 'amber'}">${nAvail} / ${nDates} 天 · ${coverage}%</span>
+        </div>
+        <div class="grid-2">
+          <div>
+            <div class="kv-row"><span class="k">申请范围</span><span class="v">${esc(bboxText)}</span></div>
+            <div class="kv-row"><span class="k">成像时刻</span><span class="v">${esc(timeText)}</span></div>
+            <div class="kv-row"><span class="k">日期 / 批次</span><span class="v">${nDates} 景 · ${d.n_batches || 0} 批${limits.max_dates ? `（每批 ≤ ${limits.max_dates}）` : ''}</span></div>
+            <div class="kv-row"><span class="k">产品目录</span><span class="v">${o.exists ? '已建立' : '尚未创建'}</span></div>
+          </div>
+          <div>
+            <div class="kv-row"><span class="k">最近申请</span><span class="v">${lastReq ? `${esc(lastReq.submitted_at || '—')} · ${esc(lastReq.email_masked || '***')}` : '尚未申请'}</span></div>
+            <div class="kv-row"><span class="k">最近导入</span><span class="v">${lastImp ? `${esc(lastImp.created_at || '—')} · ${lastImp.n_files || 0} 个文件` : '尚未导入'}</span></div>
+            <div class="kv-row"><span class="k">缺失日期</span><span class="v">${missing.length ? `${esc(missing.slice(0, 6).join('、'))}${missing.length > 6 ? ` 等 ${missing.length} 天` : ''}` : '无'}</span></div>
+          </div>
+        </div>
+        ${warnings.length ? warnings.map(w => `<div class="inline-note danger" style="margin-top:8px">${esc(w)}</div>`).join('') : ''}
+        ${failed.length ? `<div class="inline-note danger" style="margin-top:8px">最近申请有 ${failed.length} 批失败：${esc(failed.map(b => b.error || '未知错误').join('；'))}</div>` : ''}
+        ${lastReq && lastReq.message ? `<div class="small muted" style="margin-top:8px">${esc(lastReq.message)}</div>` : ''}
+        <div class="btn-row" style="margin-top:12px">
+          <button class="btn btn-primary" id="btn-gacos-request" data-run>申请 GACOS 产品</button>
+          <button class="btn" id="btn-gacos-import-url" data-run>导入邮件链接</button>
+          <button class="btn" id="btn-gacos-upload" data-run>上传 tar.gz / 产品文件</button>
+          <a class="btn btn-ghost" href="${esc(formUrl)}" target="_blank" rel="noopener">打开官网</a>
+        </div>
+        <div class="small muted" style="margin-top:7px">官方限制：单次 ≤ ${limits.max_dates || 20} 个日期、范围 ≤ ${limits.max_span_deg || 10}°，服务器约保留 72 小时；产品到手后请尽快导入。</div>
       </div>`;
   }
 
@@ -1174,7 +1365,208 @@
       renderStepContent();
     });
     const run = $('#btn-run-atm');
-    if (run) run.addEventListener('click', () => runStep('atmosphere'));
+    if (run) run.addEventListener('click', () => {
+      const ov = state.overview || {};
+      const params = state.project.params || {};
+      const method = params.atmosphere_method || (ov.atmosphere && ov.atmosphere.method) || (ov.project && ov.project.demo ? 'gacos' : 'empirical');
+      const source = params.gacos_source || state.atmSource || (ov.project && ov.project.demo ? 'demo' : 'official');
+      const official = (ov.gacos && ov.gacos.official) || {};
+      const missing = official.n_dates && (official.n_available || 0) < official.n_dates;
+      if (method === 'gacos' && source === 'official' && missing) {
+        toast(`官方 GACOS 还缺 ${official.n_dates - (official.n_available || 0)} 个日期，请先导入邮件链接或 tar.gz。`, 'error');
+        return;
+      }
+      runStep('atmosphere');
+    });
+    const req = $('#btn-gacos-request');
+    if (req) req.addEventListener('click', openGacosRequest);
+    const importUrl = $('#btn-gacos-import-url');
+    if (importUrl) importUrl.addEventListener('click', openGacosImport);
+    const upload = $('#btn-gacos-upload');
+    if (upload) upload.addEventListener('click', openGacosUpload);
+  }
+
+  function gacosDefaults() {
+    const g = (state.overview && state.overview.gacos) || {};
+    return { defaults: g.defaults || {}, official: g.official || {}, limits: g.limits || {} };
+  }
+
+  function openGacosRequest() {
+    const { defaults: d, official: o, limits } = gacosDefaults();
+    const nDates = d.n_dates || o.n_dates || 0;
+    const bbox = Array.isArray(d.bbox) ? d.bbox : ['', '', '', ''];
+    const nBatches = d.n_batches || (nDates ? Math.ceil(nDates / (limits.max_dates || 20)) : 0);
+    const split = nBatches > 1
+      ? `<label class="checkline" style="margin-top:8px"><input type="checkbox" id="gacos-allow-split"><span>允许拆分为 ${nBatches} 批申请<span class="help">每批最多 ${limits.max_dates || 20} 个日期，邮箱会收到 ${nBatches} 封邮件。</span></span></label>`
+      : '';
+    showModal(`<div class="modal-head">
+      <div><span class="eyebrow">GACOS · REQUEST</span><h2>申请官方 GACOS 产品</h2><p>提交到 gacos.net，处理完成后产品会发送到邮箱。邮箱只用于本次申请，不写入项目。</p></div>
+      <button class="modal-close" aria-label="关闭">×</button>
+    </div>
+    <div class="modal-body">
+      <div class="form-grid">
+        <div class="field"><label>接收邮箱 <span class="unit">必填</span></label><input type="email" id="gacos-email" placeholder="name@example.com" autocomplete="off"></div>
+        <div class="field"><label>输出格式</label><select id="gacos-format">
+          <option value="geotiff" selected>GeoTIFF（推荐）</option>
+          <option value="binary">Binary grid（.ztd + .rsc）</option>
+        </select></div>
+      </div>
+      <div class="form-grid" style="margin-top:9px">
+        <div class="field"><label>西 W</label><input type="number" id="gacos-w" step="any" value="${esc(bbox[0] ?? '')}"></div>
+        <div class="field"><label>南 S</label><input type="number" id="gacos-s" step="any" value="${esc(bbox[1] ?? '')}"></div>
+        <div class="field"><label>东 E</label><input type="number" id="gacos-e" step="any" value="${esc(bbox[2] ?? '')}"></div>
+        <div class="field"><label>北 N</label><input type="number" id="gacos-n" step="any" value="${esc(bbox[3] ?? '')}"></div>
+      </div>
+      <div class="form-grid" style="margin-top:9px">
+        <div class="field"><label>UTC 时</label><input type="number" id="gacos-hour" min="0" max="23" value="${esc(d.hour ?? 0)}"></div>
+        <div class="field"><label>UTC 分</label><input type="number" id="gacos-minute" min="0" max="59" value="${esc(d.minute ?? 0)}"></div>
+        <div class="field"><label>日期数量</label><input type="text" value="${nDates} 景${nBatches > 1 ? ` · ${nBatches} 批` : ''}" disabled></div>
+      </div>
+      ${split}
+      <div class="inline-note" style="margin-top:10px">官方单次最多 ${limits.max_dates || 20} 个日期、范围最大 ${limits.max_span_deg || 10}° × ${limits.max_span_deg || 10}°，服务器约保留 72 小时。提交后请留意邮箱里的下载链接或 tar.gz。</div>
+      ${nDates ? '' : '<div class="inline-note danger" style="margin-top:8px">当前项目没有日期列表，无法申请。</div>'}
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-ghost" id="gacos-req-cancel">取消</button>
+      <button class="btn btn-primary" id="gacos-req-submit" ${nDates ? '' : 'disabled'}>提交申请</button>
+    </div>`, true);
+    $('#gacos-req-cancel').addEventListener('click', closeModal);
+    $('#gacos-req-submit').addEventListener('click', submitGacosRequest);
+  }
+
+  async function submitGacosRequest() {
+    const { defaults: d } = gacosDefaults();
+    const email = ($('#gacos-email').value || '').trim();
+    const bbox = ['gacos-w', 'gacos-s', 'gacos-e', 'gacos-n'].map(id => Number($(`#${id}`).value));
+    const hour = Number($('#gacos-hour').value);
+    const minute = Number($('#gacos-minute').value);
+    if (!email) { toast('请填写接收邮箱', 'error'); return; }
+    if (bbox.some(v => !Number.isFinite(v))) { toast('请填写完整的 W/S/E/N 范围', 'error'); return; }
+    if (!Number.isInteger(hour) || hour < 0 || hour > 23 || !Number.isInteger(minute) || minute < 0 || minute > 59) {
+      toast('UTC 时必须在 0–23，分必须在 0–59', 'error');
+      return;
+    }
+    const btn = $('#gacos-req-submit');
+    btn.disabled = true;
+    btn.textContent = '提交中…';
+    try {
+      const result = await api(`/api/projects/${encodeURIComponent(state.projectId)}/gacos/request`, {
+        method: 'POST',
+        body: {
+          bbox,
+          dates: d.dates || [],
+          email,
+          hour,
+          minute,
+          output_format: $('#gacos-format').value,
+          allow_split: !!($('#gacos-allow-split') && $('#gacos-allow-split').checked),
+        },
+      });
+      closeModal();
+      await refreshGacosStatus();
+      if (result.ok) toast(result.message || 'GACOS 申请已提交，请查收邮箱。', 'success');
+      else if (result.partial) toast(result.message || '部分 GACOS 申请已提交，请检查失败批次。', 'info');
+      else toast(result.message || 'GACOS 申请未成功。', 'error');
+    } catch (err) {
+      toast(err.message, 'error');
+      btn.disabled = false;
+      btn.textContent = '提交申请';
+    }
+  }
+
+  function openGacosImport() {
+    showModal(`<div class="modal-head">
+      <div><span class="eyebrow">GACOS · EMAIL IMPORT</span><h2>导入邮件下载链接</h2><p>把 GACOS 邮件里的 tar.gz 下载链接粘进来；也可以填写本机已下载的文件或目录路径。</p></div>
+      <button class="modal-close" aria-label="关闭">×</button>
+    </div>
+    <div class="modal-body">
+      <div class="field"><label>下载链接 <span class="unit">每行一个</span></label><textarea id="gacos-urls" rows="5" placeholder="https://…/gacos_20230103.tar.gz&#10;https://…/gacos_20230115.tar.gz"></textarea></div>
+      <div class="field" style="margin-top:9px"><label>本机路径 <span class="unit">可选，每行一个</span></label><textarea id="gacos-paths" rows="3" placeholder="D:\\Downloads\\gacos_20230103.tar.gz&#10;D:\\Downloads\\gacos_20230115.tar.gz"></textarea></div>
+      <div class="inline-note" style="margin-top:10px">只接受公网 http/https 链接；私网、回环和本机地址会被拒绝。tar.gz/zip 会做路径穿越、符号链接、条目数和解压体积检查。</div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-ghost" id="gacos-import-cancel">取消</button>
+      <button class="btn btn-primary" id="gacos-import-submit">开始导入</button>
+    </div>`, true);
+    $('#gacos-import-cancel').addEventListener('click', closeModal);
+    $('#gacos-import-submit').addEventListener('click', submitGacosImport);
+  }
+
+  async function submitGacosImport() {
+    const urls = ($('#gacos-urls').value || '').split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+    const paths = ($('#gacos-paths').value || '').split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+    if (!urls.length && !paths.length) { toast('请至少填写一个下载链接或本机路径', 'error'); return; }
+    const btn = $('#gacos-import-submit');
+    btn.disabled = true;
+    btn.textContent = '导入中…';
+    try {
+      const result = await api(`/api/projects/${encodeURIComponent(state.projectId)}/gacos/import`, {
+        method: 'POST',
+        body: { urls, paths },
+      });
+      closeModal();
+      await refreshGacosStatus();
+      reportGacosImport(result);
+    } catch (err) {
+      toast(err.message, 'error');
+      btn.disabled = false;
+      btn.textContent = '开始导入';
+    }
+  }
+
+  function openGacosUpload() {
+    showModal(`<div class="modal-head">
+      <div><span class="eyebrow">GACOS · UPLOAD</span><h2>上传 tar.gz 或产品文件</h2><p>选择邮件下载的压缩包，或已经解压出来的 .tif / .ztd+.rsc / .npy 文件。</p></div>
+      <button class="modal-close" aria-label="关闭">×</button>
+    </div>
+    <div class="modal-body">
+      <div class="field"><label>选择文件 <span class="unit">可多选</span></label><input type="file" id="gacos-files" multiple accept=".tar.gz,.tgz,.tar,.zip,.tif,.tiff,.ztd,.rsc,.npy,.dat,.bin"></div>
+      <div class="inline-note" style="margin-top:10px">单次上传上限 512 MiB；压缩包解压后上限 2 GiB。产品文件名需要包含 YYYYMMDD 或 YYYY-MM-DD 才能匹配项目日期。</div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-ghost" id="gacos-upload-cancel">取消</button>
+      <button class="btn btn-primary" id="gacos-upload-submit">上传并导入</button>
+    </div>`, true);
+    $('#gacos-upload-cancel').addEventListener('click', closeModal);
+    $('#gacos-upload-submit').addEventListener('click', submitGacosUpload);
+  }
+
+  async function submitGacosUpload() {
+    const files = $('#gacos-files').files;
+    if (!files || !files.length) { toast('请选择至少一个 GACOS 文件', 'error'); return; }
+    const form = new FormData();
+    for (const file of files) form.append('files', file);
+    const btn = $('#gacos-upload-submit');
+    btn.disabled = true;
+    btn.textContent = '上传并导入中…';
+    try {
+      const result = await apiUpload(`/api/projects/${encodeURIComponent(state.projectId)}/gacos/import`, form);
+      closeModal();
+      await refreshGacosStatus();
+      reportGacosImport(result);
+    } catch (err) {
+      toast(err.message, 'error');
+      btn.disabled = false;
+      btn.textContent = '上传并导入';
+    }
+  }
+
+  function reportGacosImport(result) {
+    const imported = result.imported || [];
+    const errors = result.errors || [];
+    const dates = new Set();
+    imported.forEach(item => (item.dates || []).forEach(d => dates.add(d)));
+    if (imported.length) {
+      toast(`已导入 ${imported.length} 个来源${dates.size ? ` · ${dates.size} 个日期` : ''}${errors.length ? ` · ${errors.length} 个失败` : ''}。`, errors.length ? 'info' : 'success');
+    }
+    if (errors.length) toast(`导入失败：${errors[0].error || errors[0].source || '未知错误'}`, 'error');
+    if (!imported.length && !errors.length) toast('没有导入任何文件。', 'error');
+  }
+
+  async function refreshGacosStatus() {
+    if (!state.projectId) return;
+    await refreshOverview({ keepStep: true });
+    renderAll();
   }
 
   /* --------------------------------------------------------------- step 6 · inversion */
@@ -1229,10 +1621,9 @@
             <div class="field"><label>PS 相干性下限</label><input type="number" data-param="ps_coherence_min" min="0.2" max="0.95" step="0.01" value="${esc(pval('ps_coherence_min', 0.62))}"></div>
           </div>` : ''}
           ${tech === 'ds' ? `<div class="divider"></div><div class="form-grid">
-            <div class="field"><label>DS 块大小 <span class="unit">px</span></label><input type="number" data-param="ds_patch" min="4" max="32" value="${esc(pval('ds_patch', 10))}"></div>
-            <div class="field"><label>块重叠</label><input type="number" data-param="ds_overlap" min="0" max="0.9" step="0.1" value="${esc(pval('ds_overlap', 0.5))}"></div>
-            <div class="field"><label>相位链接</label><select data-param="ds_phase_linking">${[['emi', '特征值分解（EMI）'], ['eigenvalue', '特征值分解（兼容）']].map(([v, l]) => `<option value="${v}" ${pval('ds_phase_linking', 'emi') === v ? 'selected' : ''}>${l}</option>`).join('')}</select></div>
-          </div>` : ''}
+            <div class="field"><label>DS 相干窗口 <span class="unit">px</span></label><input type="number" data-param="ds_patch" min="4" max="32" value="${esc(pval('ds_patch', 9))}"></div>
+          </div>
+          <div class="small muted expert-only">相位链接固定使用特征值分解（EMI）；相干矩阵按逐像元滑窗估计，窗口重叠率固定为 100%，因此不再提供重叠率和链接方法选项。</div>` : ''}
         </div>
         <div class="card">
           <div class="card-head"><div><h3>结果摘要</h3><div class="hint">${existing ? '当前项目已有这一路线的产品。' : '运行后在此显示摘要，并自动进入成果页。'}</div></div></div>
@@ -1329,7 +1720,7 @@
         ${statCard('成果文件', `${(ov.files || []).length}<small> 个</small>`, 'GeoTIFF · CSV · PNG · DOCX')}
       </div>
       <div class="card" style="margin-top:14px">
-        <div class="card-head"><div><h3>主图</h3><div class="hint">点击任意图件可放大查看。</div></div><div class="btn-row"><button class="btn btn-small" id="btn-make-report">生成报告</button><a class="btn btn-small btn-primary" href="/api/projects/${encodeURIComponent(state.projectId)}/export">下载成果包 ZIP</a></div></div>
+        <div class="card-head"><div><h3>主图</h3><div class="hint">点击任意图件可放大查看。</div></div><div class="btn-row"><button class="btn btn-small" id="btn-make-report">生成报告</button><button class="btn btn-small btn-primary" id="btn-export">下载成果包 ZIP</button></div></div>
         ${figs.length ? `<div class="figure-grid">${figs.map(([key, label, unit]) => `
           <div class="figure-card" data-src="${assetUrl(ov.assets[key])}">
             <img src="${assetUrl(ov.assets[key])}" alt="${esc(label)}">
@@ -1448,6 +1839,8 @@
   function bindResultsStep() {
     const report = $('#btn-make-report');
     if (report) report.addEventListener('click', makeReport);
+    const exportBtn = $('#btn-export');
+    if (exportBtn) exportBtn.addEventListener('click', openExportDialog);
     const valBtn = $('#btn-validate-2');
     if (valBtn) valBtn.addEventListener('click', validateNow);
     const query = $('#btn-series-query');
@@ -1477,6 +1870,38 @@
       $('#series-col').value = state.seriesPoint.col;
     }
     drawSeries();
+  }
+
+  async function openExportDialog() {
+    const projectId = state.projectId;
+    if (!projectId) return;
+    showModal(`<div class="modal-head"><div><span class="eyebrow">EXPORT</span><h2>下载成果包</h2><p>选择需要的体积与内容范围。</p></div><button class="modal-close">×</button></div>
+      <div class="modal-body"><div class="empty-mini">正在统计导出体积…</div></div>`);
+    let summary = null;
+    try {
+      summary = await api(`/api/projects/${encodeURIComponent(projectId)}/export/summary`);
+    } catch (err) {
+      summary = null;
+    }
+    const modes = (summary && summary.modes) || {};
+    const option = (mode, title, desc, recommended) => {
+      const info = modes[mode] || {};
+      const size = info.human ? `约 ${info.human} · ${info.files} 个文件` : '体积统计不可用';
+      return `<div class="export-option ${recommended ? 'recommended' : ''}">
+        <div class="export-copy"><h3>${title}${recommended ? '<span class="tag">推荐</span>' : ''}</h3><p>${desc}</p><div class="small muted">${size}</div></div>
+        <button class="btn ${recommended ? 'btn-primary' : ''}" data-export-mode="${mode}">下载</button>
+      </div>`;
+    };
+    $('.modal-body').innerHTML = `<div class="export-list">
+      ${option('results', '成果包', '速率/位移、相干性、GeoTIFF、CSV、图件与报告，不含原始 SLC 和中间数组。', true)}
+      ${option('full', '完整包', '在成果包基础上加入原始 SLC、配准栈、干涉图与大气产品，适合归档或换机复现。', false)}
+    </div>
+    <div class="inline-note" style="margin-top:12px">体积为未压缩合计，ZIP 实际文件通常更小。导出在请求内同步生成，项目较大时需要稍等。</div>`;
+    $$('[data-export-mode]').forEach(btn => btn.addEventListener('click', () => {
+      const mode = btn.dataset.exportMode;
+      closeModal();
+      window.location.href = `/api/projects/${encodeURIComponent(projectId)}/export?mode=${encodeURIComponent(mode)}`;
+    }));
   }
 
   async function makeReport() {
@@ -1844,7 +2269,7 @@
         const target = nextStepFor(kind);
         if (target) state.step = target;
       } else {
-        await loadProjects().catch(() => {});
+        await loadProjects({ refresh: true }).catch(() => {});
       }
       if (window.matchMedia('(max-width: 1180px)').matches) {
         setTimeout(() => { const panel = $('#console'); if (panel) panel.classList.remove('open'); }, 1400);
@@ -1934,7 +2359,8 @@
       technique: technique || 'sbas',
       name: technique ? `${techMeta(technique).cn}演示项目` : '阿尔卑斯山谷 · 演示',
       path: '',
-      dem: ''
+      dem: '',
+      coregistered: false
     };
     renderNewProjectModal();
   }
@@ -1957,6 +2383,7 @@
       ${isImport ? `
         <div class="field" style="margin-top:12px"><label>数据目录或文件路径</label><input type="text" id="np-path" value="${esc(np.path)}" placeholder="D:\\data\\sentinel1\\stack"></div>
         <div class="field"><label>DEM 路径 <span class="unit">可选</span></label><input type="text" id="np-dem" value="${esc(np.dem)}" placeholder="D:\\data\\dem.tif"></div>
+        <label class="checkline"><input type="checkbox" id="np-coregistered" ${np.coregistered ? 'checked' : ''}><span>导入的 SLC 已经配准<span class="help">勾选后直接使用现有配准栈，不再执行二次配准。</span></span></label>
         <div class="inline-note">支持原生 NumPy 栈、ENVI 栈、复数 GeoTIFF 目录与 Sentinel-1 SAFE（实验）。导入时会尽量读取同目录的 meta.json。</div>
       ` : `
         <div class="inline-note">将生成 24 景 Sentinel-1 风格 SLC，包含已知滑坡形变、季节性波动、大气延迟、DEM 误差与亚像元配准偏移。<b>完全离线</b>，创建后即可一键运行。</div>
@@ -1978,6 +2405,8 @@
     if (pathInput) pathInput.addEventListener('input', ev => { np.path = ev.target.value; });
     const demInput = $('#np-dem');
     if (demInput) demInput.addEventListener('input', ev => { np.dem = ev.target.value; });
+    const coregInput = $('#np-coregistered');
+    if (coregInput) coregInput.addEventListener('change', ev => { np.coregistered = ev.target.checked; });
     $('#np-cancel').addEventListener('click', closeModal);
     $('#np-create').addEventListener('click', createProject);
   }
@@ -1987,6 +2416,7 @@
     if ($('#np-name')) np.name = $('#np-name').value;
     if ($('#np-path')) np.path = $('#np-path').value;
     if ($('#np-dem')) np.dem = $('#np-dem').value;
+    if ($('#np-coregistered')) np.coregistered = $('#np-coregistered').checked;
   }
 
   async function createProject() {
@@ -1999,12 +2429,22 @@
     btn.textContent = np.source === 'demo' ? '正在生成演示数据…' : '正在导入…';
     try {
       const body = { name: np.name.trim(), technique: np.technique, source: np.source };
-      if (np.source === 'import') { body.path = np.path.trim(); body.dem_path = np.dem.trim(); }
+      if (np.source === 'import') {
+        body.path = np.path.trim();
+        body.dem_path = np.dem.trim();
+        if (np.coregistered) body.meta = { already_coregistered: true };
+      }
       const data = await api('/api/projects', { method: 'POST', body });
       closeModal();
       await loadProjects();
       await openProject(data.project.id);
-      toast(np.source === 'demo' ? '演示项目已生成，可以开始跑流程了。' : '数据导入完成。', 'success');
+      const warns = (data.project.stack && data.project.stack.import_warnings) || [];
+      if (np.source === 'demo') {
+        toast('演示项目已生成，可以开始跑流程了。', 'success');
+      } else {
+        toast(`数据导入完成${warns.length ? ` · ${warns.length} 条提示` : ''}。`, warns.length ? 'info' : 'success');
+        if (warns.length) toast(`导入提示：${warns[0]}`, 'info');
+      }
     } catch (err) {
       toast(err.message, 'error');
       btn.disabled = false;

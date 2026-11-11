@@ -16,8 +16,11 @@ import numpy as np
 from scipy import ndimage
 
 from ..config import DEFAULT_PROCESSING
+from ..params import dinsar_pair_indices
+from .geocode import geocode_products
 from .geotiff import write_geotiff
 from .io import load_stack
+from .memory import ensure_memory_budget, estimate_inversion_peak, inversion_block_pixels
 from .plotting import save_raster, save_series
 from .utils import (
     atomic_write_json,
@@ -26,7 +29,6 @@ from .utils import (
     nan_gaussian_filter,
     read_json,
     stable_reference,
-    temporal_coherence,
     wrap_phase,
 )
 
@@ -215,49 +217,59 @@ def _solve_weighted(
     p, rows, cols = phase.shape
     phase_flat = phase.reshape(p, -1)
     mask_flat = mask.reshape(p, -1)
+    n_pixels = phase_flat.shape[1]
     coverage = mask_flat.mean(axis=0)
-    phi = np.where(mask_flat, phase_flat, 0.0).astype(np.float32)
     w = weights.astype(np.float64).copy()
-    pw = np.ones(rows * cols, dtype=np.float64)
+    pixel_weight = np.ones(n_pixels, dtype=np.float64)
     if extra_weight is not None:
-        pw = np.clip(np.asarray(extra_weight, dtype=np.float64).reshape(-1), 1e-3, 1.0)
-    sqrt_w = np.sqrt(w)[:, None] * np.sqrt(pw)[None, :]
-    extra_rows = G.shape[0] - p
-    # Regularisation rows are not tied to the pixel quality weight.
-    sqrt_w_full = np.vstack([sqrt_w, np.ones((extra_rows, phi.shape[1]), dtype=np.float64)])
-    zeros_extra = np.zeros((extra_rows, phi.shape[1]), dtype=np.float32)
-    X = np.zeros((n_dates, rows * cols), dtype=np.float32)
+        pixel_weight = np.clip(np.asarray(extra_weight, dtype=np.float64).reshape(-1), 1e-3, 1.0)
+    sqrt_pixel_weight = np.sqrt(pixel_weight)
+    X = np.zeros((n_dates, n_pixels), dtype=np.float32)
     if not (coverage >= 0.25).any():
         return X.reshape(n_dates, rows, cols), coverage.reshape(rows, cols)
 
+    # Y holds phase * sqrt(weight) for observed pairs.  Regularisation rows
+    # are implicitly zero in GtWy, so only the pair rows are materialised.
+    # float64 matches the pre-refactor solve and avoids amplifying float32
+    # rounding through ill-conditioned networks during robust iterations.
+    Y = np.empty((p, n_pixels), dtype=np.float64)
+    eye = np.eye(G.shape[1], dtype=np.float64)[:, :, None] * 1e-9
+    block = inversion_block_pixels(n_dates)
     for it in range(max(1, iterations)):
-        # The design matrix is identical for every pixel; only the diagonal
-        # weights differ.  Batched normal equations are far cheaper than a
-        # per-pixel SVD and fit comfortably in memory for a 24-date stack.
-        Y = np.vstack([phi * sqrt_w, zeros_extra])
-        if it > 0:
-            pred = A @ X
-            miss = ~mask_flat
-            Y[:p] = np.where(miss, pred * sqrt_w, Y[:p])
-        sw2 = (sqrt_w_full**2).astype(np.float64)
-        block = 4096
-        X = np.empty((n_dates, phi.shape[1]), dtype=np.float32)
-        for s in range(0, phi.shape[1], block):
-            e = min(phi.shape[1], s + block)
-            W = sw2[:, s:e]
+        sqrt_w = np.sqrt(w)
+        for s in range(0, n_pixels, block):
+            e = min(n_pixels, s + block)
+            # Per-block weights: float64 for the normal equations.  Nothing
+            # pair-sized beyond Y itself is materialised.
+            sw = sqrt_w[:, None] * sqrt_pixel_weight[None, s:e]
+            observed = np.where(mask_flat[:, s:e], phase_flat[:, s:e], 0.0)
+            Y[:, s:e] = observed * sw
+            if it > 0:
+                pred = A @ X[:, s:e]
+                missing = ~mask_flat[:, s:e]
+                Y[:, s:e][missing] = (pred * sw)[missing]
+            W = np.ones((G.shape[0], e - s), dtype=np.float64)
+            W[:p] = sw * sw
+            # The design matrix is identical for every pixel; only the
+            # diagonal weights differ.  Batched normal equations are far
+            # cheaper than a per-pixel SVD.
             GtWG = np.einsum("mn,mp,ml->nlp", G, W, G, optimize=True)
-            GtWy = np.einsum("mn,mp,mp->np", G, W, Y[:, s:e], optimize=True)
-            GtWG = GtWG + np.eye(G.shape[1], dtype=np.float64)[:, :, None] * 1e-9
+            GtWy = np.einsum("mn,mp,mp->np", G[:p], W[:p], Y[:, s:e], optimize=True)
+            GtWG = GtWG + eye
             X[:, s:e] = np.linalg.solve(GtWG.transpose(2, 0, 1), GtWy.T).T.astype(np.float32)
-        model = (G[:p] @ X).astype(np.float32)
-        resid = np.where(mask_flat, phase_flat - model, np.nan)
-        med = np.nanmedian(np.abs(resid), axis=1)
+        # Per-pair residual median, one pair at a time.  The previous
+        # full-cube residual, absolute value and float64 model copies were
+        # several gigabytes on a 93-pair PS stack.
+        med = np.empty(p, dtype=np.float64)
+        for k in range(p):
+            model = (G[k] @ X).astype(np.float32)
+            row = np.where(mask_flat[k], phase_flat[k] - model, np.nan)
+            med[k] = np.nanmedian(np.abs(row))
         sigma = np.nanmedian(med) if np.isfinite(med).any() else 1.0
         sigma = max(float(sigma), 1e-3)
         ratio = med / (3.0 * sigma)
         new_w = np.clip(1.0 / (1.0 + ratio**2), 0.04, 1.0)
         w = weights * new_w
-        sqrt_w = np.sqrt(w)[:, None] * np.sqrt(pw)[None, :]
     return X.reshape(n_dates, rows, cols), coverage.reshape(rows, cols)
 
 
@@ -306,14 +318,24 @@ def _aps_screens(
             np.cos(4 * np.pi * t),
         ]
     )
-    Xf = x_3d.reshape(n_dates, -1).astype(np.float64)
-    coef = np.linalg.pinv(B) @ Xf
-    resid = (Xf - B @ coef).reshape(n_dates, rows, cols)
     screens = np.zeros((n_dates, rows, cols), dtype=np.float32)
+    if n_dates == 0:
+        return screens
+    x_flat = x_3d.reshape(n_dates, -1)
+    n_pixels = x_flat.shape[1]
+    pinv = np.linalg.pinv(B)
+    # Fit the temporal model blockwise instead of converting the whole date
+    # cube to float64.  The coefficients are only 6 x n_pixels.
+    coef = np.empty((pinv.shape[0], n_pixels), dtype=np.float64)
+    block = 8192
+    for s in range(0, n_pixels, block):
+        e = min(n_pixels, s + block)
+        coef[:, s:e] = pinv @ x_flat[:, s:e].astype(np.float64)
+    # Residual and smoothing are also per date: a full float64 residual cube
+    # would double the APS working set for no accuracy gain.
     for i in range(n_dates):
-        sm = ndimage.gaussian_filter(
-            np.nan_to_num(resid[i], nan=0.0), sigma=sigma, mode="nearest"
-        )
+        resid = np.nan_to_num(x_flat[i].astype(np.float64) - B[i] @ coef, nan=0.0)
+        sm = ndimage.gaussian_filter(resid.reshape(rows, cols), sigma=sigma, mode="nearest")
         sm -= np.nanmedian(sm)
         screens[i] = sm.astype(np.float32)
     return screens
@@ -384,7 +406,6 @@ def invert_arrays(
             for k, pair in enumerate(pairs):
                 phase_corr[k] = phase_corr[k] - (screens[int(pair["sec"])] - screens[int(pair["ref"])])
 
-    X = X.copy()
     X -= X[0]
     coverage_valid = coverage >= 0.45
     if extra_mask is not None:
@@ -399,15 +420,38 @@ def invert_arrays(
     X -= X[:, rr, cc][:, None, None]
 
     disp = X * float(stack_meta["wavelength_m"]) / (4.0 * np.pi) * 1000.0
-    model = (A @ X.reshape(n_dates, -1)).reshape(len(pairs), *phase.shape[1:])
-    resid = np.where(mask, phase_corr - model, np.nan)
-    tcoh = temporal_coherence(np.nan_to_num(resid, nan=0.0))
+    n_pixels = phase.shape[1] * phase.shape[2]
+    phase_corr_flat = phase_corr.reshape(len(pairs), -1)
+    mask_flat = mask.reshape(len(pairs), -1)
+    # Residuals are assembled block by block in float32.  The old version
+    # materialised two full float64 cubes (phase - model and np.where(...))
+    # before reducing them, which cost well over a gigabyte on large PS
+    # stacks for no accuracy benefit.
+    resid = np.empty((len(pairs), n_pixels), dtype=np.float32)
+    X_flat = X.reshape(n_dates, -1)
+    block = inversion_block_pixels(n_dates)
+    for s in range(0, n_pixels, block):
+        e = min(n_pixels, s + block)
+        model = A @ X_flat[:, s:e]
+        resid[:, s:e] = phase_corr_flat[:, s:e] - model
+    resid[~mask_flat] = np.nan
+    # Accumulate temporal coherence and residual scatter pair by pair instead
+    # of building a full complex64 exp() cube and another full float32 copy.
+    phase_sum = np.zeros(n_pixels, dtype=np.complex64)
+    sq_sum = np.zeros(n_pixels, dtype=np.float64)
+    for k in range(len(pairs)):
+        row = np.nan_to_num(resid[k], nan=0.0)
+        phase_sum += np.exp(1j * row)
+        sq_sum += np.square(row, dtype=np.float64)
+    tcoh = (np.abs(phase_sum) / max(1, len(pairs))).astype(np.float32).reshape(phase.shape[1:])
+    del resid, phase_corr, phase_sum
     valid = coverage_valid & np.isfinite(disp).all(axis=0)
     disp[:, ~valid] = np.nan
     eps = np.where(valid, eps, np.nan)
-    sq = np.nan_to_num(resid, nan=0.0) ** 2
-    cnt = np.isfinite(resid).sum(axis=0)
-    resid_std = np.sqrt(np.divide(sq.sum(axis=0), cnt, out=np.zeros(sq.shape[1:], dtype=np.float64), where=cnt > 0))
+    cnt = mask.sum(axis=0).reshape(-1)
+    resid_std = np.sqrt(
+        np.divide(sq_sum, cnt, out=np.zeros(n_pixels, dtype=np.float64), where=cnt > 0)
+    ).reshape(phase.shape[1:])
     disp_std = resid_std * float(stack_meta["wavelength_m"]) / (4.0 * np.pi) * 1000.0
     vel, lin_rmse = _fit_velocity(np.nan_to_num(disp, nan=0.0), days, valid)
     vel = np.where(valid, vel, np.nan)
@@ -478,6 +522,7 @@ def _save_products(
 
     vel = result["velocity_mm_yr"]
     valid = result["valid"]
+    stack_dem = np.asarray(load_stack(root).dem, dtype=np.float32)
     save_raster(
         vel,
         fig / "velocity.png",
@@ -488,7 +533,7 @@ def _save_products(
         divergent=True,
         symmetric=True,
         bounds=bounds,
-        overlay=np.asarray(load_stack(root).dem, dtype=np.float32)[:: max(1, int(params.get("multilook", 2))), :: max(1, int(params.get("multilook", 2)))][: vel.shape[0], : vel.shape[1]],
+        overlay=stack_dem[:: max(1, int(params.get("multilook", 2))), :: max(1, int(params.get("multilook", 2)))][: vel.shape[0], : vel.shape[1]],
         overlay_alpha=0.18,
     )
     save_raster(
@@ -548,6 +593,24 @@ def _save_products(
             for i, d in enumerate(stack_meta["dates"]):
                 w.writerow([d, rr, cc, float(result["disp_mm"][i, rr, cc]), rr2, cc2, float(result["disp_mm"][i, rr2, cc2])])
 
+    geocode_products_input = {
+        "velocity_mm_yr": result["velocity_mm_yr"],
+        "dem_error_m": result["dem_error_m"],
+        "temporal_coherence": result["temporal_coherence"],
+    }
+    for idx, day in enumerate(stack_meta["dates"]):
+        geocode_products_input[f"disp_{str(day).replace('-', '')}"] = result["disp_mm"][idx]
+    geocode_info = geocode_products(
+        root,
+        stack_meta,
+        params,
+        product_shape=(int(valid.shape[0]), int(valid.shape[1])),
+        grid_meta=grid_meta,
+        dem=stack_dem,
+        products=geocode_products_input,
+        technique=technique,
+    )
+
     summary = {
         "technique": technique,
         "n_dates": len(stack_meta["dates"]),
@@ -571,6 +634,7 @@ def _save_products(
         },
         "bounds": bounds,
         "params": params,
+        "geocoding": geocode_info,
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
     if extra:
@@ -597,17 +661,25 @@ def run_dinsar(
     pair = pairs[0]
     wanted = p.get("dinsar_pair")
     if wanted:
-        if isinstance(wanted, str):
-            for candidate in pairs:
-                if str(candidate.get("id")) == wanted:
-                    pair = candidate
-                    break
-        elif isinstance(wanted, (list, tuple)) and len(wanted) == 2:
-            key = tuple(sorted((int(wanted[0]), int(wanted[1]))))
-            for candidate in pairs:
-                if (int(candidate.get("ref")), int(candidate.get("sec"))) == key:
-                    pair = candidate
-                    break
+        try:
+            wanted_indices = dinsar_pair_indices(wanted, n_dates=stack.n_dates)
+        except ValueError as exc:
+            raise RuntimeError(f"dinsar_pair 无效：{exc}") from exc
+        if wanted_indices:
+            key = tuple(sorted(wanted_indices))
+            match = next(
+                (
+                    candidate
+                    for candidate in pairs
+                    if (int(candidate.get("ref")), int(candidate.get("sec"))) == key
+                ),
+                None,
+            )
+            if match is None:
+                raise RuntimeError(
+                    f"请求的干涉对 {wanted_indices[0]:02d}_{wanted_indices[1]:02d} 不在当前网络中，请重新运行网络阶段"
+                )
+            pair = match
     pid = str(pair["id"])
     pair_dir = root / "interferograms" / pid
     if progress:
@@ -664,6 +736,22 @@ def run_dinsar(
     )
     if bounds[1] > bounds[3]:
         bounds = (bounds[0], bounds[3], bounds[2], bounds[1])
+    write_geotiff(
+        geo / "disp_pair_mm.tif",
+        disp_mm,
+        corner_lon=float(grid["corner_lon"]),
+        corner_lat=float(grid["corner_lat"]),
+        lon_step=float(grid["lon_step"]),
+        lat_step=float(grid["lat_step"]),
+    )
+    write_geotiff(
+        geo / "coherence.tif",
+        coh,
+        corner_lon=float(grid["corner_lon"]),
+        corner_lat=float(grid["corner_lat"]),
+        lon_step=float(grid["lon_step"]),
+        lat_step=float(grid["lat_step"]),
+    )
     save_raster(
         disp_mm,
         fig / "dinsar_displacement.png",
@@ -690,6 +778,16 @@ def run_dinsar(
         save_wrapped_phase(wrapped, coh, fig / "dinsar_wrapped.png", mask=valid, title=f"Wrapped phase · {pid}")
     except Exception:
         pass
+    geocode_info = geocode_products(
+        root,
+        stack.meta,
+        p,
+        product_shape=(int(valid.shape[0]), int(valid.shape[1])),
+        grid_meta=grid,
+        dem=stack.dem,
+        products={"disp_pair_mm": disp_mm, "coherence": coh},
+        technique="dinsar",
+    )
     summary = {
         "technique": "dinsar",
         "pair": pair,
@@ -705,6 +803,7 @@ def run_dinsar(
         "grid": grid,
         "bounds": bounds,
         "params": p,
+        "geocoding": geocode_info,
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
     atomic_write_json(products / "inversion.json", summary)
@@ -729,6 +828,13 @@ def run_inversion(
     technique = (technique or stack.meta.get("technique", "sbas")).lower()
     if technique == "dinsar":
         return run_dinsar(root, p, progress)
+    m = max(1, int(p.get("multilook", 2)))
+    n_pixels = max(1, stack.rows // m) * max(1, stack.cols // m)
+    aps = str(p.get("aps_method", "spatiotemporal")).lower() != "off" and int(p.get("aps_iterations", 0)) > 0
+    ensure_memory_budget(
+        estimate_inversion_peak(len(pairs), n_pixels, stack.n_dates, aps=aps),
+        "时序反演",
+    )
     if progress:
         progress(0.02, "载入干涉相位")
     phase, coh, mask, kept = load_pair_cube(root, pairs, corrected=True)
@@ -743,6 +849,8 @@ def run_inversion(
 
         m = max(1, int(p.get("multilook", 1)))
         ps = select_ps(stack, coh, mask, {**p, "multilook": m})
+        if int(ps["mask"].sum()) == 0:
+            raise RuntimeError("PS 候选点为 0：请降低 ps_adi_max 或 ps_coherence_min，或检查振幅和有效掩膜")
         extra_mask = ps["mask"]
         extra_weight = ps["weight"]
         extra = {"ps": ps["stats"], **ps["stats"]}
@@ -753,7 +861,7 @@ def run_inversion(
         linked = read_json(root / "data" / "processed" / "ds_reference.json", {}) or {}
         extra = {
             "ds_patch": int(p.get("ds_patch", 9)),
-            "ds_phase_linking": "eigenvalue",
+            "phase_linking": "emi",
             "ds_reference_pixel": [linked.get("row"), linked.get("col")],
         }
 

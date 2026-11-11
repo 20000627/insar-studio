@@ -116,31 +116,34 @@ def _write_marker(path: Path, text: str = "x") -> None:
     path.write_text(text, encoding="utf-8")
 
 
-def test_product_files_skips_file_removed_during_scan(tmp_path, monkeypatch):
+def test_product_files_skips_directory_removed_during_scan(tmp_path, monkeypatch):
     """A job purge must not turn a project listing into a 404."""
     store = ProjectStore(tmp_path / "projects")
     project = store.create("并发扫描", "sbas")
-    figures = store.path(project["id"]) / "products" / "figures"
+    products = store.path(project["id"]) / "products"
+    figures = products / "figures"
     figures.mkdir(parents=True)
-    (figures / "velocity.png").write_bytes(b"keep")
-    (figures / "vanishing.png").write_bytes(b"gone")
+    (figures / "velocity.png").write_bytes(b"gone")
+    other = products / "other"
+    other.mkdir()
+    (other / "keep.json").write_text("{}", encoding="utf-8")
 
-    real_stat = Path.stat
-    calls = {"count": 0}
+    real_scandir = project_module.os.scandir
 
-    def flaky_stat(self, *args, **kwargs):
-        if self.name == "vanishing.png":
-            calls["count"] += 1
-            if calls["count"] >= 2:
-                raise FileNotFoundError(self)
-        return real_stat(self, *args, **kwargs)
+    def flaky_scandir(path):
+        if Path(path).name == "figures":
+            raise FileNotFoundError(path)
+        return real_scandir(path)
 
-    monkeypatch.setattr(Path, "stat", flaky_stat)
+    monkeypatch.setattr(project_module.os, "scandir", flaky_scandir)
 
     files = store.product_files(project["id"])
-    assert [item["name"] for item in files] == ["velocity.png"]
+    assert [item["name"] for item in files] == ["keep.json"]
     overview = store.overview(project["id"])
     assert overview["project"]["id"] == project["id"]
+    assert overview["files"] == []
+    with_files = store.overview(project["id"], include_files=True)
+    assert [item["name"] for item in with_files["files"]] == ["keep.json"]
 
 
 def test_purge_downstream_preserves_upstream_products(tmp_path):

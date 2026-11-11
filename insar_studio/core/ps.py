@@ -20,13 +20,59 @@ from .io import Stack
 from .utils import downsample_real
 
 
-def amplitude_dispersion(stack: Stack, multilook: int = 1, max_images: int = 12) -> np.ndarray:
+def amplitude_dispersion(
+    stack: Stack,
+    multilook: int = 1,
+    max_images: int = 12,
+    *,
+    block_rows: int | None = None,
+) -> np.ndarray:
+    """Estimate amplitude dispersion without materialising every image.
+
+    The old implementation built a list of up to 12 full-resolution amplitude
+    arrays.  This version accumulates first and second moments one row block at
+    a time, so peak memory is proportional to the block height, not the whole
+    stack.  The result is numerically the population standard deviation divided
+    by the mean amplitude.
+    """
     n = stack.n_dates
+    m = max(1, int(multilook))
+    rows, cols = int(stack.slc.shape[1]), int(stack.slc.shape[2])
+    out_rows, out_cols = rows // m, cols // m
+    if out_rows <= 0 or out_cols <= 0:
+        return np.empty((max(out_rows, 0), max(out_cols, 0)), dtype=np.float32)
+
     step = max(1, n // max(1, max_images))
-    amps = np.asarray([np.abs(stack.slc[i]) for i in range(0, n, step)], dtype=np.float32)
-    mean = np.maximum(amps.mean(axis=0), 1e-6)
-    adi = amps.std(axis=0) / mean
-    return downsample_real(adi, multilook).astype(np.float32)
+    indices = list(range(0, n, step))
+    count = max(1, len(indices))
+
+    if block_rows is None:
+        # sum, sum of squares, one amplitude block and its square: ~32 B/px.
+        per_row = max(1, cols * 32)
+        budget_rows = max(m, (128 * 1024 * 1024) // per_row)
+        block_rows = max(m, (budget_rows // m) * m)
+    else:
+        block_rows = max(m, (max(1, int(block_rows)) // m) * m)
+
+    adi = np.empty((out_rows, out_cols), dtype=np.float32)
+    for r0 in range(0, rows, block_rows):
+        r1 = min(rows, r0 + block_rows)
+        height = r1 - r0
+        sum_amp = np.zeros((height, cols), dtype=np.float64)
+        sum_sq = np.zeros((height, cols), dtype=np.float64)
+        for i in indices:
+            amp = np.abs(np.asarray(stack.slc[i, r0:r1, :], dtype=np.complex64)).astype(np.float64)
+            amp[~np.isfinite(amp)] = 0.0
+            sum_amp += amp
+            sum_sq += amp * amp
+        mean = sum_amp / count
+        variance = np.maximum(sum_sq / count - mean * mean, 0.0)
+        block_adi = (np.sqrt(variance) / np.maximum(mean, 1e-6)).astype(np.float32)
+
+        block_ds = downsample_real(block_adi, m)
+        out0 = r0 // m
+        adi[out0 : out0 + block_ds.shape[0], : block_ds.shape[1]] = block_ds
+    return adi
 
 
 def select_ps(
@@ -46,7 +92,20 @@ def select_ps(
     adi = adi[:rows, :cols]
     if adi.shape != (rows, cols):
         adi = np.pad(adi, ((0, rows - adi.shape[0]), (0, cols - adi.shape[1])), mode="edge")
-    mean_coh = np.nanmean(coherence, axis=0)
+    # Accumulate finite pair coherence one pair at a time instead of creating a
+    # full NaN mask for the whole cube.
+    total = np.zeros((rows, cols), dtype=np.float64)
+    count = np.zeros((rows, cols), dtype=np.int32)
+    for pair_coh in coherence:
+        finite = np.isfinite(pair_coh)
+        total += np.where(finite, pair_coh, 0.0)
+        count += finite
+    mean_coh = np.divide(
+        total,
+        count,
+        out=np.zeros((rows, cols), dtype=np.float64),
+        where=count > 0,
+    ).astype(np.float32)
     base = np.asarray(valid, dtype=bool).any(axis=0)
     adi_max = float(params.get("ps_adi_max", 0.28))
     coh_min = float(params.get("ps_coherence_min", 0.62))
@@ -54,8 +113,15 @@ def select_ps(
     candidate = base & (adi <= adi_max) & (mean_coh >= coh_min)
     # If the thresholds are too strict for a small demo, relax them once and
     # keep the best 1.5% of pixels so the technique still produces a result.
+    # Never invent candidates when no pair coherence is finite: in that case a
+    # PS solution would be meaningless and the caller should report emptiness.
     relaxed = False
-    if candidate.sum() < max(30, 0.002 * base.sum()):
+    finite_coh = np.isfinite(mean_coh) & (count > 0)
+    if (
+        candidate.sum() < max(30, 0.002 * base.sum())
+        and finite_coh.any()
+        and float(np.nanmax(mean_coh[finite_coh])) > 0
+    ):
         relaxed = True
         score = (1.0 / (adi + 0.03)) * np.clip(mean_coh, 0, 1)
         score[~base] = -np.inf

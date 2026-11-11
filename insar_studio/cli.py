@@ -60,12 +60,15 @@ def cmd_demo(args) -> int:
         print(f"数据目录: {store.path(project['id'])}")
         return 0
     t0 = time.time()
-    result = run_pipeline(
-        store.path(project["id"]),
-        technique=technique,
-        params=project.get("params", {}),
-        progress=_progress,
-    )
+    try:
+        result = run_pipeline(
+            store.path(project["id"]),
+            technique=technique,
+            params=project.get("params", {}),
+            progress=_progress,
+        )
+    except (RuntimeError, ValueError) as exc:
+        raise SystemExit(f"处理失败：{exc}") from exc
     print()
     inv = result.get("inversion", {})
     print(f"完成 · {time.time() - t0:.1f} s")
@@ -89,7 +92,10 @@ def cmd_run(args) -> int:
     project = _find(store, args.project)
     technique = (args.technique or project.get("technique", "sbas")).lower()
     t0 = time.time()
-    result = run_pipeline(store.path(project["id"]), technique=technique, params=project.get("params", {}), progress=_progress)
+    try:
+        result = run_pipeline(store.path(project["id"]), technique=technique, params=project.get("params", {}), progress=_progress)
+    except (RuntimeError, ValueError) as exc:
+        raise SystemExit(f"处理失败：{exc}") from exc
     print()
     print(f"完成 · {time.time() - t0:.1f} s · {json.dumps(result.get('inversion', {}), ensure_ascii=False)[:300]}")
     return 0

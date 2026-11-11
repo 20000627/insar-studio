@@ -12,6 +12,7 @@ which is otherwise a silent source of corrupt results.
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 import traceback
@@ -21,6 +22,24 @@ from typing import Any, Callable
 
 from .config import WORKSPACE_DIR
 from .core.utils import atomic_write_json, json_safe, read_json
+from .params import redact_secrets
+
+
+FINISHED_STATUSES = ("done", "failed", "cancelled", "interrupted")
+ACTIVE_STATUSES = ("queued", "running", "cancelling")
+
+
+def _max_concurrent_from_env(default: int = 2) -> int:
+    raw = os.environ.get("INSAR_MAX_CONCURRENT_JOBS", "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default
+    if value < 1:
+        return default
+    return min(value, 32)
 
 
 class JobCancelled(RuntimeError):
@@ -62,26 +81,56 @@ class JobContext:
 class JobManager:
     MAX_JOBS = 300
 
-    def __init__(self, jobs_dir: Path | None = None) -> None:
+    def __init__(self, jobs_dir: Path | None = None, *, max_concurrent: int | None = None) -> None:
         self.root = Path(jobs_dir or (WORKSPACE_DIR / "jobs"))
         self.root.mkdir(parents=True, exist_ok=True)
+        self.max_concurrent = (
+            max(1, min(int(max_concurrent), 32))
+            if max_concurrent is not None
+            else _max_concurrent_from_env()
+        )
+        self._slots = threading.BoundedSemaphore(self.max_concurrent)
         self._jobs: dict[str, dict[str, Any]] = {}
         self._threads: dict[str, threading.Thread] = {}
         self._cancel: dict[str, threading.Event] = {}
         self._lock = threading.RLock()
-        self._prune_old_files()
         self._load_existing()
 
-    def _prune_old_files(self) -> None:
-        files = sorted(self.root.glob("job_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-        for path in files[self.MAX_JOBS :]:
-            try:
-                path.unlink()
-            except OSError:
-                pass
+    def _prune_runtime(self) -> None:
+        """Bound in-memory jobs and delete files for evicted records.
+
+        The initial implementation only trimmed ``job_*.json`` at startup while
+        ``_jobs`` and ``_cancel`` grew forever.  Keep active jobs regardless of
+        the limit; evict the oldest finished ones in insertion order so a long
+        running server stays bounded.
+        """
+        with self._lock:
+            excess = len(self._jobs) - self.MAX_JOBS
+            if excess > 0:
+                finished = [
+                    job_id
+                    for job_id, job in self._jobs.items()
+                    if job.get("status") in FINISHED_STATUSES
+                ]
+                for job_id in finished[:excess]:
+                    self._jobs.pop(job_id, None)
+                    self._cancel.pop(job_id, None)
+            # Remove files whose records are no longer tracked (evicted or
+            # unreadable).  Active and retained jobs stay untouched.
+            for path in self.root.glob("job_*.json"):
+                if path.stem not in self._jobs:
+                    try:
+                        path.unlink()
+                    except OSError:
+                        pass
 
     def _load_existing(self) -> None:
-        for path in sorted(self.root.glob("job_*.json")):
+        # Oldest first: insertion order then drives runtime pruning.
+        paths = sorted(
+            self.root.glob("job_*.json"),
+            key=lambda p: (p.stat().st_mtime, p.name),
+        )
+        for path in paths:
             data = read_json(path)
             if not isinstance(data, dict) or not data.get("id"):
                 continue
@@ -92,6 +141,7 @@ class JobManager:
                 data["finished_at"] = data.get("updated_at", "")
                 atomic_write_json(path, data)
             self._jobs[data["id"]] = data
+        self._prune_runtime()
 
     def _path(self, job_id: str) -> Path:
         return self.root / f"{job_id}.json"
@@ -148,7 +198,14 @@ class JobManager:
         return self.get(job_id, include_logs=False)
 
     def _run(self, job_id: str, func: Callable[[JobContext], Any], ctx: JobContext) -> None:
+        acquired = False
         try:
+            # Wait for a global execution slot.  Queued jobs keep their thread
+            # alive but do no work; cancellation is checked while waiting.
+            while not ctx.cancelled:
+                if self._slots.acquire(timeout=0.2):
+                    acquired = True
+                    break
             if ctx.cancelled:
                 self.update(job_id, status="cancelled", stage="已取消", finished_at=time.strftime("%Y-%m-%d %H:%M:%S"))
                 return
@@ -161,7 +218,7 @@ class JobManager:
                 progress=1.0,
                 stage="完成",
                 finished_at=time.strftime("%Y-%m-%d %H:%M:%S"),
-                result=json_safe(result),
+                result=redact_secrets(json_safe(result)),
             )
         except JobCancelled:
             self.update(job_id, status="cancelled", stage="已取消", finished_at=time.strftime("%Y-%m-%d %H:%M:%S"))
@@ -176,8 +233,12 @@ class JobManager:
                 finished_at=time.strftime("%Y-%m-%d %H:%M:%S"),
             )
         finally:
+            if acquired:
+                self._slots.release()
             with self._lock:
                 self._threads.pop(job_id, None)
+                self._cancel.pop(job_id, None)
+            self._prune_runtime()
 
     def update(self, job_id: str, **patch: Any) -> dict[str, Any] | None:
         with self._lock:

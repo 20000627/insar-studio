@@ -1,0 +1,54 @@
+{
+  "schema": "insar-studio/stack/v1",
+  "name": "2025-01-07 Dingri Mw 7.0 earthquake — derived D-InSAR replay stack",
+  "source": "public-unwrapped-product-replay",
+  "demo": false,
+  "platform": "Sentinel-1A",
+  "orbit_direction": "ASCENDING",
+  "relative_orbit": null,
+  "rows": 500,
+  "cols": 500,
+  "n_dates": 2,
+  "dates": [
+    "2025-01-05",
+    "2025-01-17"
+  ],
+  "sampling_days": [
+    0,
+    12
+  ],
+  "wavelength_m": 0.055465763,
+  "incidence_deg": 38.0,
+  "range_spacing_m": 2.329562,
+  "azimuth_spacing_m": 13.9,
+  "slant_range_m": 705000.0,
+  "bperp_m": [
+    0.0,
+    0.0
+  ],
+  "start_times": [
+    "2025-01-05T00:00:00",
+    "2025-01-17T00:00:00"
+  ],
+  "corner_lon": 86.89319444192,
+  "corner_lat": 29.42513882954,
+  "lon_step": 0.00250000002,
+  "lat_step": -0.00250000002,
+  "crs": "EPSG:4326",
+  "ref_index": 0,
+  "already_coregistered": true,
+  "geo_referenced": true,
+  "notes": "Derived from the CC-BY-4.0 GAMMA unwrapped product on Zenodo 14836721. The coseismic lobe was cropped, no-data pixels were nearest-filled, a Gaussian sigma=10 smoothing and 3x block mean were applied, and the phase was divided by 10 to keep the built-in unwrapper stable. Multiply the workbench displacement by 10. This is a replay/derived stack, not raw Sentinel-1 SLC.",
+  "replay_phase_scale": 10.0,
+  "source_doi": "10.5281/zenodo.14836721",
+  "source_url": "https://zenodo.org/api/records/14836721/files/ASC_20250105_20250117.adf_quad.unw.geo.tif/content",
+  "source_md5": "894d51cb912ff24ece4af8931d8ee57c",
+  "source_license": "CC-BY-4.0",
+  "crop_row": 569,
+  "crop_col": 1288,
+  "crop_size": 1500,
+  "gaussian_sigma": 10.0,
+  "downsample_factor": 3,
+  "reference_row": 24,
+  "reference_col": 63
+}

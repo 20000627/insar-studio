@@ -50,6 +50,7 @@ DEFAULT_PROCESSING = {
     "min_coherence": 0.25,
     "estimate_dem_error": False,
     "remove_ramp": True,
+    "ramp_order": 1,
     "robust_iterations": 3,
     "regularization": 0.30,
     "aps_method": "spatiotemporal",
@@ -59,8 +60,6 @@ DEFAULT_PROCESSING = {
     "ps_adi_max": 0.28,
     "ps_coherence_min": 0.62,
     "ds_patch": 9,
-    "ds_overlap": 0.5,
-    "ds_phase_linking": "emi",
     "dinsar_pair": None,
 }
 
@@ -120,7 +119,13 @@ FORMATS = {
     "stack": ["目录 + stack.json", "ENVI 栈 (.hdr/.dat)", "NumPy 栈 (.npy/.npz)"],
     "slc": ["Sentinel-1 SAFE（实验）", "复数 GeoTIFF", "SNAP/ISCE 导出"],
     "dem": [".tif/.tiff", ".npy", "ENVI"],
-    "gacos": [".ztd + .rsc", ".tif", ".npy"],
+    "gacos": [
+        "官方 tar.gz（申请 / 邮件导入）",
+        "邮件页面下载链接",
+        ".ztd + .rsc",
+        ".tif",
+        ".npy",
+    ],
 }
 
 

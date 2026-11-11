@@ -17,7 +17,7 @@ import json
 import math
 from typing import Any, Iterable
 
-from .config import DEFAULT_PROCESSING
+from .config import DEFAULT_PROCESSING, TECHNIQUES
 
 
 class ParamError(ValueError):
@@ -45,6 +45,7 @@ INT_RANGES: dict[str, tuple[int, int]] = {
     "ref_index": (0, 1_000_000),
     "reference_row": (0, 1_000_000),
     "reference_col": (0, 1_000_000),
+    "ramp_order": (1, 2),
     "tile": (16, 256),
     "upsample": (1, 100),
 }
@@ -59,17 +60,15 @@ FLOAT_RANGES: dict[str, tuple[float, float]] = {
     "aps_sigma_px": (1.0, 120.0),
     "ps_adi_max": (0.01, 0.8),
     "ps_coherence_min": (0.01, 0.99),
-    "ds_overlap": (0.0, 0.95),
 }
 
 ENUMS: dict[str, set[str]] = {
     "filter": {"boxcar", "goldstein", "gaussian", "gauss", "nlmeans", "nl-means", "nlm", "none"},
     "unwrap_method": {"quality", "snaphu", "skimage", "least-squares", "least_squares"},
     "aps_method": {"spatiotemporal", "off"},
-    "ds_phase_linking": {"emi", "eigenvalue"},
     "reference_mode": {"auto", "manual"},
     "atmosphere_method": {"gacos", "empirical", "off", "demo"},
-    "gacos_source": {"demo", "local", "online"},
+    "gacos_source": {"demo", "official", "local", "online"},
     "model": {"affine", "translation", "similarity"},
     "orbit_direction": {"ascending", "descending", "unknown"},
 }
@@ -85,6 +84,7 @@ STAGE_PARAM_KEYS: dict[str, tuple[str, ...]] = {
         "max_perpendicular_baseline",
         "max_pairs",
         "ref_index",
+        "dinsar_pair",
     ),
     "interferometry": (
         "multilook",
@@ -98,11 +98,16 @@ STAGE_PARAM_KEYS: dict[str, tuple[str, ...]] = {
         "unwrap_method",
         "unwrap_coherence_min",
         "remove_ramp",
+        "ramp_order",
         "snaphu_exe",
+        "ds_patch",
+        "ds_coherence_min",
+        "ds_filter_size",
     ),
     "atmosphere": (
         "atmosphere_method",
         "gacos_source",
+        "gacos_dir",
         "gacos_email",
         "aps_method",
         "aps_sigma_px",
@@ -120,9 +125,6 @@ STAGE_PARAM_KEYS: dict[str, tuple[str, ...]] = {
         "ps_adi_max",
         "ps_coherence_min",
         "ps_star_all",
-        "ds_patch",
-        "ds_overlap",
-        "ds_phase_linking",
         "dinsar_pair",
         "ref_index",
         "reference_mode",
@@ -184,9 +186,122 @@ def is_secret_key(key: str) -> bool:
     }
 
 
+def _strip_secrets(value: Any) -> Any:
+    """Recursively drop credential-bearing keys from an output-safe payload."""
+    if isinstance(value, dict):
+        return {
+            key: _strip_secrets(item)
+            for key, item in value.items()
+            if not is_secret_key(str(key))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_strip_secrets(item) for item in value]
+    return value
+
+
 def public_params(params: dict[str, Any] | None) -> dict[str, Any]:
     """Return a copy safe to persist in project metadata and reports."""
-    return {k: v for k, v in (params or {}).items() if not is_secret_key(k)}
+    stripped = _strip_secrets(params or {})
+    return stripped if isinstance(stripped, dict) else {}
+
+
+#: Replacement used when a credential-bearing field must stay visible in an
+#: output file instead of being removed outright.
+REDACTED = "***"
+
+
+def redact_secrets(value: Any) -> Any:
+    """Recursively replace credential-looking values before JSON serialisation.
+
+    Engine summaries are produced by many different stages, so filtering only
+    ``project.json`` is not enough.  Walking the final payload at the write
+    boundary guarantees that a newly added stage cannot accidentally persist a
+    token, password or authorization header.  Non-secret values and container
+    shapes are preserved; secret values become :data:`REDACTED`.
+    """
+    if isinstance(value, dict):
+        return {
+            key: (REDACTED if is_secret_key(str(key)) else redact_secrets(item))
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [redact_secrets(item) for item in value]
+    return value
+
+
+
+def dinsar_pair_indices(value: Any, *, n_dates: int | None = None) -> tuple[int, int] | None:
+    """Normalize a D-InSAR pair selector to sorted zero-based indices.
+
+    Accepted forms are ``"00_05"``, ``"0_5"``, ``[0, 5]`` and ``(0, 5)``.
+    A pair id and an explicit index pair therefore resolve to the same thing.
+    """
+    if value is None or value == "":
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        parts = text.split("_")
+        if len(parts) != 2 or any(not part.isdigit() for part in parts):
+            raise ParamError("dinsar_pair 必须是干涉对编号（如 00_05）或两个日期索引")
+        pair = (int(parts[0]), int(parts[1]))
+    elif isinstance(value, (list, tuple)):
+        if len(value) != 2:
+            raise ParamError("dinsar_pair 必须包含两个日期索引")
+        pair = (_as_int("dinsar_pair", value[0]), _as_int("dinsar_pair", value[1]))
+    else:
+        raise ParamError("dinsar_pair 格式不正确")
+    if pair[0] < 0 or pair[1] < 0 or pair[0] == pair[1]:
+        raise ParamError("dinsar_pair 的两个日期索引必须不同且非负")
+    pair = tuple(sorted(pair))
+    if n_dates is not None and pair[1] >= int(n_dates):
+        raise ParamError(f"dinsar_pair 索引超出影像数量（0–{max(0, int(n_dates) - 1)}）")
+    return pair
+
+
+def min_dates_for(technique: str) -> int:
+    """Return the minimum number of acquisitions required by a technique.
+
+    ``config.TECHNIQUES`` is the single source of truth.  This helper exists so
+    that every entry point (import, route switch and pipeline) enforces the
+    same value instead of duplicating literals.
+    """
+    key = str(technique or "").lower()
+    spec = TECHNIQUES.get(key)
+    if spec is None:
+        raise ParamError(f"未知技术路线: {technique}")
+    try:
+        return max(2, int(spec.get("min_dates", 2)))
+    except (TypeError, ValueError):
+        return 2
+
+
+def require_min_dates(
+    technique: str,
+    n_dates: int | None,
+    *,
+    action: str = "处理该数据",
+) -> int:
+    """Raise a readable :class:`ParamError` when the stack is too short.
+
+    ``n_dates=None`` means the project has no imported stack yet.  Route
+    selection and project creation are allowed in that state; the check is
+    applied as soon as real acquisitions exist.
+    """
+    required = min_dates_for(technique)
+    if n_dates is None:
+        return required
+    try:
+        actual = int(n_dates)
+    except (TypeError, ValueError) as exc:
+        raise ParamError("影像数量无效") from exc
+    if actual < required:
+        key = str(technique or "").lower()
+        label = str(TECHNIQUES[key].get("name") or key.upper())
+        hint = "，或改用 D-InSAR 等对影像数要求更低的路线" if required > 2 else ""
+        raise ParamError(
+            f"{label} 至少需要 {required} 景影像，当前只有 {actual} 景，无法{action}{hint}。"
+        )
+    return required
 
 
 def validate_params(
@@ -282,9 +397,8 @@ def validate_params(
         for key in ("ref_index", "reference_row", "reference_col"):
             if key in out and out[key] is not None and int(out[key]) >= int(n_dates) and key == "ref_index":
                 raise ParamError(f"参考影像索引必须在 0–{max(0, int(n_dates) - 1)} 之间")
-        ref = out.get("dinsar_pair")
-        if isinstance(ref, (list, tuple)) and n_dates and max(ref) >= int(n_dates):
-            raise ParamError("D-InSAR 干涉对索引超出影像数量")
+        if out.get("dinsar_pair") is not None:
+            dinsar_pair_indices(out["dinsar_pair"], n_dates=n_dates)
     return out
 
 
@@ -300,14 +414,15 @@ def with_atmosphere_defaults(params: dict[str, Any], *, demo: bool) -> dict[str,
     """Fill the implicit atmosphere method/source used by the engine.
 
     The defaults are data-source dependent (demo projects use simulated GACOS,
-    imported projects use the empirical correction).  Recording them keeps
-    stage fingerprints comparable even when the UI never had to save them.
+    imported projects default to the official asynchronous GACOS route once the
+    user selects GACOS).  Recording them keeps stage fingerprints comparable
+    even when the UI never had to save them.
     """
     out = dict(params)
     if not out.get("atmosphere_method"):
         out["atmosphere_method"] = "gacos" if demo else "empirical"
     if not out.get("gacos_source"):
-        out["gacos_source"] = "demo" if demo else "local"
+        out["gacos_source"] = "demo" if demo else "official"
     return out
 
 

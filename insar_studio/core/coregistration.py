@@ -14,9 +14,11 @@ from typing import Any, Callable
 import numpy as np
 from scipy import ndimage
 from skimage.registration import phase_cross_correlation
-from skimage.transform import AffineTransform, estimate_transform, warp
+from skimage.transform import AffineTransform, warp
+from skimage.transform import estimate_transform as skimage_estimate_transform
 
 from .io import Stack, load_stack, safe_join
+from .memory import ensure_memory_budget, estimate_coregistration_peak
 from .plotting import save_histogram
 from .utils import atomic_write_json, read_json
 
@@ -129,12 +131,14 @@ def estimate_transform(
         src_xy = np.column_stack([src[:, 1], src[:, 0]])
         dst_xy = np.column_stack([dst[:, 1], dst[:, 0]])
         # Estimate output -> input directly; warp() consumes this as inverse_map.
-        transform = estimate_transform("affine", dst_xy, src_xy)
+        fit_model = "similarity" if model == "similarity" else "affine"
+        transform = skimage_estimate_transform(fit_model, dst_xy, src_xy)
         pred = transform(dst_xy)
         residual = pred - src_xy
         rms = float(np.sqrt(np.mean(residual**2)))
-        info["affine_rms_px"] = rms
-        # A wild affine fit is worse than a pure translation
+        info["rms_px"] = rms
+        info[f"{fit_model}_rms_px"] = rms
+        # A wild fit is worse than a pure translation
         if not np.all(np.isfinite(transform.params)) or rms > 0.75:
             t = np.median(shifts, axis=0)
             transform = AffineTransform(translation=(-t[1], -t[0]))
@@ -143,6 +147,11 @@ def estimate_transform(
             info["shift_col"] = float(t[1])
         else:
             info["matrix"] = transform.params.tolist()
+            info["model"] = fit_model
+            if fit_model == "similarity":
+                # Record the interpretable decomposition as well as the matrix.
+                info["scale"] = float(transform.scale)
+                info["rotation_deg"] = float(np.degrees(transform.rotation))
     except Exception:
         t = np.median(shifts, axis=0)
         transform = AffineTransform(translation=(-t[1], -t[0]))
@@ -163,7 +172,7 @@ def _apply_transform(image: np.ndarray, transform: AffineTransform, *, fast: boo
             image.real, shift=shift, order=3, mode="nearest"
         ) + 1j * ndimage.shift(image.imag, shift=shift, order=3, mode="nearest")
     real = warp(
-        image.real,
+        np.ascontiguousarray(image.real, dtype=np.float32),
         inverse_map=transform,
         order=3,
         mode="edge",
@@ -171,7 +180,7 @@ def _apply_transform(image: np.ndarray, transform: AffineTransform, *, fast: boo
         clip=False,
     )
     imag = warp(
-        image.imag,
+        np.ascontiguousarray(image.imag, dtype=np.float32),
         inverse_map=transform,
         order=3,
         mode="edge",
@@ -209,7 +218,19 @@ def coregister_stack(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     ref_amp = stack.amplitude(ref_index)
-    out = np.empty_like(stack.slc, dtype=np.complex64)
+    ensure_memory_budget(estimate_coregistration_peak(stack.rows, stack.cols), "配准")
+    # Write the resampled stack through a memory map.  A full in-RAM output
+    # would double the stack footprint and is the first thing to fail on large
+    # scenes.
+    coreg_path = out_dir / "slc_coreg.npy"
+    if coreg_path.exists():
+        coreg_path.unlink()
+    out = np.lib.format.open_memmap(
+        coreg_path,
+        mode="w+",
+        dtype=np.complex64,
+        shape=stack.slc.shape,
+    )
     out[ref_index] = stack.slc[ref_index]
     transforms: list[dict[str, Any]] = []
     shifts = np.zeros((n, 2), dtype=np.float32)
@@ -240,7 +261,7 @@ def coregister_stack(
             progress(0.04 + 0.86 * (i + 1) / n, f"配准 {i + 1}/{n} · {stack.dates[i]} · 偏移 {t[1]:+.2f}/{t[0]:+.2f} px")
 
     coreg_path = out_dir / "slc_coreg.npy"
-    np.save(coreg_path, out, allow_pickle=False)
+    out.flush()
 
     coh_before = []
     coh_after = []
